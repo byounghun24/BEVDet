@@ -7,6 +7,7 @@ from .kitti_dataset import KittiDataset
 from .kitti_mono_dataset import KittiMonoDataset
 from .lyft_dataset import LyftDataset
 from .nuscenes_dataset import NuScenesDataset
+from .tcar_dataset import TcarDataset
 from .nuscenes_mono_dataset import NuScenesMonoDataset
 from .nuscenes_dataset_occ import NuScenesDatasetOccpancy
 # yapf: disable
@@ -45,5 +46,5 @@ __all__ = [
     'RandomJitterPoints', 'ObjectNameFilter', 'AffineResize',
     'RandomShiftScale', 'LoadPointsFromDict', 'PIPELINES',
     'RangeLimitedRandomCrop', 'RandomRotate', 'MultiViewWrapper',
-    'NuScenesDatasetOccpancy'
+    'NuScenesDatasetOccpancy', 'TcarDataset'
 ]

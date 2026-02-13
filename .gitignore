@@ -115,6 +115,15 @@ data
 *.pkl.json
 *.log.json
 work_dirs/
+outputs/
+outputs_bh/
+wandb/
+*.wandb
+events.out.tfevents.*
+*.engine
+*.onnx
+*.trt
+*.plan
 exps/
 *~
 mmdet3d/.mim

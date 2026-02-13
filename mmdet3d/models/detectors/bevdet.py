@@ -246,7 +246,11 @@ class BEVDetTRT(BEVDet):
     ):
         x = self.img_backbone(img)
         x = self.img_neck(x)
-        x = self.img_view_transformer.depth_net(x)
+        if getattr(self, 'force_depth_fp32', False):
+            x_fp32 = x.float()
+            x = self.img_view_transformer.depth_net(x_fp32).to(x.dtype)
+        else:
+            x = self.img_view_transformer.depth_net(x)
         depth = x[:, :self.img_view_transformer.D].softmax(dim=1)
         tran_feat = x[:, self.img_view_transformer.D:(
             self.img_view_transformer.D +
@@ -324,12 +328,15 @@ class BEVDet4D(BEVDet):
 
         # add bev data augmentation
         bda_ = torch.zeros((n, 1, 4, 4), dtype=grid.dtype).to(grid)
-        bda_[:, :, :3, :3] = bda.unsqueeze(1)
+        bda_rot = bda[..., :3, :3] if bda.shape[-1] == 4 else bda
+        bda_[:, :, :3, :3] = bda_rot.unsqueeze(1)
         bda_[:, :, 3, 3] = 1
         c02l0 = bda_.matmul(c02l0)
         if bda_adj is not None:
             bda_ = torch.zeros((n, 1, 4, 4), dtype=grid.dtype).to(grid)
-            bda_[:, :, :3, :3] = bda_adj.unsqueeze(1)
+            bda_adj_rot = \
+                bda_adj[..., :3, :3] if bda_adj.shape[-1] == 4 else bda_adj
+            bda_[:, :, :3, :3] = bda_adj_rot.unsqueeze(1)
             bda_[:, :, 3, 3] = 1
         c12l0 = bda_.matmul(c12l0)
 
@@ -570,6 +577,80 @@ class BEVDepth4D(BEVDet4D):
                                             gt_bboxes_ignore)
         losses.update(losses_pts)
         return losses
+
+
+@DETECTORS.register_module()
+class BEVDepth4DTRT(BEVDepth4D):
+    """TRT export wrapper for BEVDepth4D.
+
+    This wrapper uses single-frame TRT BEV pool path for export/inference.
+    """
+    def result_serialize(self, outs):
+        outs_ = []
+        for out in outs:
+            for key in ['reg', 'height', 'dim', 'rot', 'vel', 'heatmap']:
+                outs_.append(out[0][key])
+        return outs_
+
+    def result_deserialize(self, outs):
+        outs_ = []
+        keys = ['reg', 'height', 'dim', 'rot', 'vel', 'heatmap']
+        for head_id in range(len(outs) // 6):
+            outs_head = [dict()]
+            for kid, key in enumerate(keys):
+                outs_head[0][key] = outs[head_id * 6 + kid]
+            outs_.append(outs_head)
+        return outs_
+
+    def forward(
+        self,
+        img,
+        mlp_input,
+        ranks_depth,
+        ranks_feat,
+        ranks_bev,
+        interval_starts,
+        interval_lengths,
+    ):
+        x = self.img_backbone(img)
+        x = self.img_neck(x)
+        if getattr(self, 'force_depth_fp32', False):
+            x_fp32 = x.float()
+            x = self.img_view_transformer.depth_net(
+                x_fp32, mlp_input.float()).to(x.dtype)
+        else:
+            x = self.img_view_transformer.depth_net(x, mlp_input)
+        depth = x[:, :self.img_view_transformer.D].softmax(dim=1)
+        tran_feat = x[:, self.img_view_transformer.D:(
+            self.img_view_transformer.D +
+            self.img_view_transformer.out_channels)]
+        tran_feat = tran_feat.permute(0, 2, 3, 1)
+        x = TRTBEVPoolv2.apply(depth.contiguous(), tran_feat.contiguous(),
+                               ranks_depth, ranks_feat, ranks_bev,
+                               interval_starts, interval_lengths)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        if self.pre_process:
+            x = self.pre_process_net(x)[0]
+        if self.num_frame > 1:
+            pad = torch.zeros_like(x)
+            x = torch.cat([x] + [pad] * (self.num_frame - 1), dim=1)
+        bev_feat = self.bev_encoder(x)
+        outs = self.pts_bbox_head([bev_feat])
+        outs = self.result_serialize(outs)
+        return outs
+
+    def get_bev_pool_input(self, input):
+        # Use key frame inputs to build pooling indices.
+        imgs, sensor2keyegos, ego2globals, intrins, post_rots, post_trans, \
+            bda, _ = self.prepare_inputs(input)
+        sensor2keyego = sensor2keyegos[0]
+        ego2global = ego2globals[0]
+        intrin = intrins[0]
+        post_rot = post_rots[0]
+        post_tran = post_trans[0]
+        coor = self.img_view_transformer.get_lidar_coor(
+            sensor2keyego, ego2global, intrin, post_rot, post_tran, bda)
+        return self.img_view_transformer.voxel_pooling_prepare_v2(coor)
 
 
 @DETECTORS.register_module()

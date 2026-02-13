@@ -5,6 +5,7 @@ from .formating import Collect3D, DefaultFormatBundle, DefaultFormatBundle3D
 from .loading import (LoadAnnotations3D, LoadAnnotations, BEVAug,
                       LoadImageFromFileMono3D, LoadMultiViewImageFromFiles,
                       LoadPointsFromDict, LoadPointsFromFile,
+                      LoadPointsFromFileTCAR,
                       LoadPointsFromMultiSweeps, NormalizePointsColor,
                       PointSegClassMapping, PointToMultiViewDepth,
                       PrepareImageInputs, LoadOccGTFromFile)
@@ -25,6 +26,7 @@ __all__ = [
     'ObjectSample', 'RandomFlip3D', 'ObjectNoise', 'GlobalRotScaleTrans',
     'PointShuffle', 'ObjectRangeFilter', 'PointsRangeFilter', 'Collect3D',
     'Compose', 'LoadMultiViewImageFromFiles', 'LoadPointsFromFile',
+    'LoadPointsFromFileTCAR',
     'DefaultFormatBundle', 'DefaultFormatBundle3D', 'DataBaseSampler',
     'NormalizePointsColor', 'LoadAnnotations3D', 'IndoorPointSample',
     'PointSample', 'PointSegClassMapping', 'MultiScaleFlipAug3D',

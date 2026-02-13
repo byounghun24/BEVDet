@@ -493,6 +493,50 @@ class LoadPointsFromFile(object):
 
 
 @PIPELINES.register_module()
+class LoadPointsFromFileTCAR(LoadPointsFromFile):
+    """Load points with TCAR-specific size handling."""
+
+    def __call__(self, results):
+        pts_filename = results['pts_filename']
+        points = self._load_points(pts_filename)
+        if points.size % self.load_dim != 0:
+            valid = points.size - (points.size % self.load_dim)
+            if valid <= 0:
+                raise ValueError(
+                    f'Loaded points has invalid size {points.size} for load_dim {self.load_dim} '
+                    f'from {pts_filename}')
+            points = points[:valid]
+        points = points.reshape(-1, self.load_dim)
+        points = points[:, self.use_dim]
+        attribute_dims = None
+
+        if self.shift_height:
+            floor_height = np.percentile(points[:, 2], 0.99)
+            height = points[:, 2] - floor_height
+            points = np.concatenate(
+                [points[:, :3],
+                 np.expand_dims(height, 1), points[:, 3:]], 1)
+            attribute_dims = dict(height=3)
+
+        if self.use_color:
+            assert len(self.use_dim) >= 6
+            if attribute_dims is None:
+                attribute_dims = dict()
+            attribute_dims.update(
+                dict(color=[
+                    points.shape[1] - 3,
+                    points.shape[1] - 2,
+                    points.shape[1] - 1,
+                ]))
+
+        points_class = get_points_type(self.coord_type)
+        points = points_class(
+            points, points_dim=points.shape[-1], attribute_dims=attribute_dims)
+        results['points'] = points
+        return results
+
+
+@PIPELINES.register_module()
 class LoadPointsFromDict(LoadPointsFromFile):
     """Load Points From Dict."""
 
@@ -1159,19 +1203,38 @@ class PrepareImageInputs(object):
 
 
 @PIPELINES.register_module()
+# class LoadAnnotations(object):
+
+#     def __call__(self, results):
+#         gt_boxes, gt_labels = results['ann_infos']
+#         gt_boxes, gt_labels = torch.Tensor(gt_boxes), torch.tensor(gt_labels)
+#         if len(gt_boxes) == 0:
+#             gt_boxes = torch.zeros(0, 9)
+#         results['gt_bboxes_3d'] = \
+#             LiDARInstance3DBoxes(gt_boxes, box_dim=gt_boxes.shape[-1],
+#                                  origin=(0.5, 0.5, 0.5))
+#         results['gt_labels_3d'] = gt_labels
+#         return results
 class LoadAnnotations(object):
 
     def __call__(self, results):
         gt_boxes, gt_labels = results['ann_infos']
-        gt_boxes, gt_labels = torch.Tensor(gt_boxes), torch.tensor(gt_labels)
-        if len(gt_boxes) == 0:
-            gt_boxes = torch.zeros(0, 9)
-        results['gt_bboxes_3d'] = \
-            LiDARInstance3DBoxes(gt_boxes, box_dim=gt_boxes.shape[-1],
-                                 origin=(0.5, 0.5, 0.5))
+
+        # list[np.ndarray] -> np.ndarray 로 먼저 합치기 (경고 제거/가속)
+        gt_boxes = np.asarray(gt_boxes, dtype=np.float32)  # (N, 9) 같은 형태
+        gt_labels = np.asarray(gt_labels, dtype=np.int64)
+
+        gt_boxes = torch.from_numpy(gt_boxes)
+        gt_labels = torch.from_numpy(gt_labels)
+
+        if gt_boxes.numel() == 0:
+            gt_boxes = torch.zeros((0, 9), dtype=torch.float32)
+
+        results['gt_bboxes_3d'] = LiDARInstance3DBoxes(
+            gt_boxes, box_dim=gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5)
+        )
         results['gt_labels_3d'] = gt_labels
         return results
-
 
 @PIPELINES.register_module()
 class BEVAug(object):

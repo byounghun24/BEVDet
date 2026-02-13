@@ -356,23 +356,28 @@ def main():
         inputs = [t.cuda() for t in data['img_inputs'][0]]
         metas = model.get_bev_pool_input(inputs)
         img = inputs[0].squeeze(0)
-        with torch.no_grad():
-            torch.onnx.export(
-                model,
-                (img.float().contiguous(), metas[1].int().contiguous(),
-                 metas[2].int().contiguous(), metas[0].int().contiguous(),
-                 metas[3].int().contiguous(), metas[4].int().contiguous()),
-                args.work_dir + model_prefix + '.onnx',
-                opset_version=11,
-                input_names=[
-                    'img', 'ranks_depth', 'ranks_feat', 'ranks_bev',
-                    'interval_starts', 'interval_lengths'
-                ],
-                output_names=[f'output_{j}' for j in
-                              range(6 * len(model.pts_bbox_head.task_heads))])
+        onnx_path = os.path.join(args.work_dir, f'{model_prefix}.onnx')
+        engine_prefix = os.path.join(args.work_dir, model_prefix)
+        if not os.path.exists(onnx_path):
+            with torch.no_grad():
+                torch.onnx.export(
+                    model,
+                    (img.float().contiguous(), metas[1].int().contiguous(),
+                     metas[2].int().contiguous(), metas[0].int().contiguous(),
+                     metas[3].int().contiguous(), metas[4].int().contiguous()),
+                    onnx_path,
+                    opset_version=11,
+                    input_names=[
+                        'img', 'ranks_depth', 'ranks_feat', 'ranks_bev',
+                        'interval_starts', 'interval_lengths'
+                    ],
+                    output_names=[f'output_{j}' for j in
+                                  range(6 * len(model.pts_bbox_head.task_heads))])
+        else:
+            print(f'Skip ONNX export, found {onnx_path}')
         break
     # check onnx model
-    onnx_model = onnx.load(args.work_dir + model_prefix + '.onnx')
+    onnx_model = onnx.load(onnx_path)
     try:
         onnx.checker.check_model(onnx_model)
     except Exception:
@@ -432,8 +437,8 @@ def main():
             metas=metas)
 
     from_onnx(
-        args.work_dir + model_prefix + '.onnx',
-        args.work_dir + model_prefix,
+        onnx_path,
+        engine_prefix,
         fp16_mode=args.fp16,
         int8_mode=args.int8,
         int8_param=dict(

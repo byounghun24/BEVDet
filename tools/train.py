@@ -176,7 +176,14 @@ def main():
     # create work_dir
     mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
     # dump config
-    cfg.dump(osp.join(cfg.work_dir, osp.basename(args.config)))
+    cfg_path = osp.join(cfg.work_dir, osp.basename(args.config))
+    try:
+        cfg.dump(cfg_path)
+    except TypeError as e:
+        if 'FormatCode' not in str(e):
+            raise
+        with open(cfg_path, 'w') as f:
+            f.write(cfg.text if getattr(cfg, 'text', None) else str(cfg._cfg_dict))
     # init the logger before other steps
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     log_file = osp.join(cfg.work_dir, f'{timestamp}.log')
@@ -200,7 +207,12 @@ def main():
     logger.info('Environment info:\n' + dash_line + env_info + '\n' +
                 dash_line)
     meta['env_info'] = env_info
-    meta['config'] = cfg.pretty_text
+    try:
+        meta['config'] = cfg.pretty_text
+    except TypeError as e:
+        if 'FormatCode' not in str(e):
+            raise
+        meta['config'] = cfg.text if getattr(cfg, 'text', None) else str(cfg._cfg_dict)
 
     # log some basic info
     logger.info(f'Distributed training: {distributed}')

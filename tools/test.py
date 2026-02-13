@@ -1,10 +1,12 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
 import os
+import time
 import warnings
 
 import mmcv
 import torch
+import torch.distributed as dist
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
@@ -16,6 +18,7 @@ from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataloader, build_dataset
 from mmdet3d.models import build_model
 from mmdet.apis import multi_gpu_test, set_random_seed
+from mmdet.apis.test import collect_results_cpu, collect_results_gpu
 from mmdet.datasets import replace_ImageToTensor
 
 if mmdet.__version__ > '2.23.0':
@@ -117,6 +120,15 @@ def parse_args():
         default='none',
         help='job launcher')
     parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument(
+        '--measure-fps',
+        action='store_true',
+        help='Measure pure inference throughput (FPS) during test.')
+    parser.add_argument(
+        '--fps-warmup',
+        type=int,
+        default=50,
+        help='Number of warmup iterations excluded from FPS measurement.')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -129,6 +141,94 @@ def parse_args():
         warnings.warn('--options is deprecated in favor of --eval-options')
         args.eval_options = args.options
     return args
+
+
+def _single_gpu_test_with_fps(model, data_loader, warmup=50):
+    model.eval()
+    results = []
+    dataset = data_loader.dataset
+    prog_bar = mmcv.ProgressBar(len(dataset))
+
+    timed_samples = 0
+    infer_elapsed = 0.0
+
+    for i, data in enumerate(data_loader):
+        with torch.no_grad():
+            start = time.perf_counter()
+            result = model(return_loss=False, rescale=True, **data)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dt = time.perf_counter() - start
+
+        results.extend(result)
+        batch_size = len(result)
+        for _ in range(batch_size):
+            prog_bar.update()
+
+        if i >= warmup:
+            timed_samples += batch_size
+            infer_elapsed += dt
+
+    fps = timed_samples / infer_elapsed if infer_elapsed > 0 else 0.0
+    return results, fps, infer_elapsed, timed_samples
+
+
+def _multi_gpu_test_with_fps(model,
+                             data_loader,
+                             tmpdir=None,
+                             gpu_collect=False,
+                             warmup=50):
+    model.eval()
+    results = []
+    dataset = data_loader.dataset
+    rank, world_size = get_dist_info()
+    if rank == 0:
+        prog_bar = mmcv.ProgressBar(len(dataset))
+
+    # Prevent deadlock in some cases.
+    time.sleep(2)
+
+    timed_samples = 0
+    infer_elapsed = 0.0
+
+    for i, data in enumerate(data_loader):
+        with torch.no_grad():
+            start = time.perf_counter()
+            result = model(return_loss=False, rescale=True, **data)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dt = time.perf_counter() - start
+
+        results.extend(result)
+
+        batch_size = len(result)
+        if i >= warmup:
+            timed_samples += batch_size
+            infer_elapsed += dt
+
+        if rank == 0:
+            for _ in range(batch_size * world_size):
+                prog_bar.update()
+
+    if gpu_collect:
+        results = collect_results_gpu(results, len(dataset))
+    else:
+        results = collect_results_cpu(results, len(dataset), tmpdir)
+
+    # Global FPS: total processed samples / max(rank elapsed wall time).
+    tensor_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    elapsed_tensor = torch.tensor(
+        [infer_elapsed], dtype=torch.float64, device=tensor_device)
+    samples_tensor = torch.tensor(
+        [timed_samples], dtype=torch.float64, device=tensor_device)
+    dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
+    dist.all_reduce(samples_tensor, op=dist.ReduceOp.SUM)
+
+    infer_elapsed_global = elapsed_tensor.item()
+    timed_samples_global = int(samples_tensor.item())
+    fps = timed_samples_global / infer_elapsed_global if infer_elapsed_global > 0 else 0.0
+
+    return results, fps, infer_elapsed_global, timed_samples_global
 
 
 def main():
@@ -234,19 +334,42 @@ def main():
         # segmentation dataset has `PALETTE` attribute
         model.PALETTE = dataset.PALETTE
 
+    fps = None
+    infer_elapsed = None
+    timed_samples = None
     if not distributed:
         model = MMDataParallel(model, device_ids=cfg.gpu_ids)
-        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+        if args.measure_fps:
+            if args.show or args.show_dir:
+                warnings.warn(
+                    '--measure-fps ignores visualization to avoid timing noise.')
+            outputs, fps, infer_elapsed, timed_samples = _single_gpu_test_with_fps(
+                model, data_loader, warmup=args.fps_warmup)
+        else:
+            outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
     else:
         model = MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
-        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
-                                 args.gpu_collect)
+        if args.measure_fps:
+            outputs, fps, infer_elapsed, timed_samples = _multi_gpu_test_with_fps(
+                model,
+                data_loader,
+                args.tmpdir,
+                args.gpu_collect,
+                warmup=args.fps_warmup)
+        else:
+            outputs = multi_gpu_test(model, data_loader, args.tmpdir,
+                                     args.gpu_collect)
 
     rank, _ = get_dist_info()
     if rank == 0:
+        if args.measure_fps:
+            print(
+                f'\nInference FPS: {fps:.3f} '
+                f'(timed_samples={timed_samples}, '
+                f'infer_time={infer_elapsed:.3f}s, warmup_iters={args.fps_warmup})')
         if args.out:
             print(f'\nwriting results to {args.out}')
             mmcv.dump(outputs, args.out)
