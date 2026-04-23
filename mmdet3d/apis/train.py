@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import random
 import warnings
+import distutils.version  # noqa: F401
 
 import numpy as np
 import torch

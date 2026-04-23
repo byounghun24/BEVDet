@@ -102,6 +102,7 @@ input_modality = dict(
 multi_adj_frame_id_cfg = (1, 1 + 1, 1)
 share_data_config = dict(
     type=dataset_type,
+    data_root=data_root,
     classes=class_names,
     modality=input_modality,
     img_info_prototype='bevdet4d',
@@ -154,3 +155,24 @@ log_config = dict(
                 project='bevdet',
                 name='bevdet-r50-4d-depth-cbgs-tcar'))
     ])
+
+checkpoint_config = None
+custom_hooks = [
+    dict(
+        type='MEGVIIEMAHook',
+        init_updates=10560,
+        priority='NORMAL',
+        save_epochs=[1, 20, 24],
+        max_keep_ckpts=1,
+    ),
+    dict(
+        type='SequentialControlHook',
+        temporal_start_epoch=2,
+    ),
+    dict(
+        type='SaveSelectedEpochsHook',
+        epochs=[1, 20, 24],
+        save_optimizer=True,
+        save_last=False,
+    ),
+]

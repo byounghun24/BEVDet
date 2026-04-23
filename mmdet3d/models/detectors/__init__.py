@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from .base import Base3DDetector
-from .bevdet import BEVDepth4D, BEVDet, BEVDet4D, BEVDetTRT, BEVStereo4D
+from .bevdet import (BEVDepth4D, BEVDepth4DDepthKD, BEVDepthDepthKD, BEVDet,
+                     BEVDet4D, BEVDetTRT, BEVStereo4D)
 from .bevdet_occ import BEVStereo4DOCC
 from .centerpoint import CenterPoint
 from .dal import DAL
@@ -28,5 +29,6 @@ __all__ = [
     'CenterPoint', 'SSD3DNet', 'ImVoteNet', 'SingleStageMono3DDetector',
     'FCOSMono3D', 'ImVoxelNet', 'GroupFree3DNet', 'PointRCNN', 'SMOKEMono3D',
     'MinkSingleStage3DDetector', 'SASSD', 'BEVDet', 'BEVDet4D', 'BEVDepth4D',
-    'BEVDetTRT', 'BEVStereo4D', 'BEVStereo4DOCC'
+    'BEVDepth4DDepthKD', 'BEVDepthDepthKD', 'BEVDetTRT', 'BEVStereo4D',
+    'BEVStereo4DOCC'
 ]

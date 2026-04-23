@@ -262,11 +262,33 @@ lr_config = dict(
     step=[24,])
 runner = dict(type='EpochBasedRunner', max_epochs=24)
 
+# Enable Weights & Biases logging.
+log_config = dict(
+    interval=50,
+    hooks=[
+        dict(type='TextLoggerHook'),
+        dict(
+            type='WandbLoggerHook',
+            init_kwargs=dict(
+                project='bevdet',
+                name='bevdet-r50'))
+    ])
+
+# Save checkpoints only at selected epochs.
+checkpoint_config = None
 custom_hooks = [
     dict(
         type='MEGVIIEMAHook',
         init_updates=10560,
         priority='NORMAL',
+        save_epochs=[1, 20, 24],
+        max_keep_ckpts=1,
+    ),
+    dict(
+        type='SaveSelectedEpochsHook',
+        epochs=[1, 20, 24],
+        save_optimizer=True,
+        save_last=False,
     ),
 ]
 

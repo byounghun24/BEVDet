@@ -169,6 +169,12 @@ class TcarDataset(NuScenesDataset):
                          result_name='pts_bbox'):
         """Evaluation for a single model in TCAR protocol."""
         from tools.tcar.tcar import TestCar
+        print('[TCAR-DEBUG] dataset_type=TcarDataset')
+        print(f'[TCAR-DEBUG] data_root={self.data_root}')
+        print(f'[TCAR-DEBUG] ann_file={self.ann_file}')
+        print(f'[TCAR-DEBUG] num_data_infos={len(self.data_infos)}')
+        if len(self.data_infos) > 0:
+            print(f"[TCAR-DEBUG] first_data_info_token={self.data_infos[0].get('token', '<missing>')}")
         self.nusc = TestCar(version=self.version, dataroot=self.data_root,
                             verbose=True)
 
@@ -186,7 +192,9 @@ class TcarDataset(NuScenesDataset):
             output_dir=output_dir,
             verbose=True,
             overlap_test=False,
-            data_infos=self.data_infos if self.overfit_eval else None
+            # Always constrain eval to the dataset view that produced predictions.
+            # This avoids split-name mismatches between TCAR scene naming and hard-coded splits.
+            data_infos=self.data_infos
         )
         self.nusc_eval.main(plot_examples=0, render_curves=False)
         metrics = mmcv.load(osp.join(output_dir, 'metrics_summary.json'))

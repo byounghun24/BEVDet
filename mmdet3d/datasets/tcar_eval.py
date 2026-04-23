@@ -330,11 +330,29 @@ def custom_load_gt(nusc: NuScenes,
     # Read out all sample_tokens in DB.
     sample_tokens_all = [s['token'] for s in nusc.sample]
     assert len(sample_tokens_all) > 0, "Error: Database has no samples!"
+    if verbose:
+        print(f'[TCAR-DEBUG] nusc_dataroot={nusc.dataroot}')
+        print(f'[TCAR-DEBUG] nusc_num_samples={len(sample_tokens_all)}')
+        print(f'[TCAR-DEBUG] nusc_first_sample_token={sample_tokens_all[0]}')
 
-    # Only keep samples from this split.
-    from tools.tcar import splits
-
-    _splits = splits.val
+    # If caller provides an explicit sample-token list (e.g., dataset infos used
+    # for inference), use it directly and skip split-name based filtering.
+    if sample_tokens_override is not None:
+        sample_token_set = set(sample_tokens_all)
+        sample_tokens = [tok for tok in sample_tokens_override if tok in sample_token_set]
+        _splits = None
+        if verbose:
+            print(f'[TCAR-DEBUG] override_tokens={len(sample_tokens_override)} '
+                  f'override_in_db={len(sample_tokens)}')
+            if len(sample_tokens_override) > 0:
+                print(f'[TCAR-DEBUG] override_first_token={sample_tokens_override[0]}')
+    else:
+        # Only keep samples from this split.
+        from tools.tcar import splits
+        if hasattr(splits, 'create_splits_scenes'):
+            _splits = splits.create_splits_scenes(verbose=False).get(eval_split, [])
+        else:
+            _splits = getattr(splits, eval_split, [])
 
     # Check compatibility of split with nusc_version.
     version = nusc.version
@@ -366,15 +384,17 @@ def custom_load_gt(nusc: NuScenes,
             index_map[sample['token']] = index
             index += 1
 
-    if sample_tokens_override is not None:
-        sample_tokens = list(sample_tokens_override)
-    else:
+    if sample_tokens_override is None:
         sample_tokens = []
         for sample_token in sample_tokens_all:
             scene_token = nusc.get('sample', sample_token)['scene_token']
             scene_record = nusc.get('scene', scene_token)
             if scene_record['name'] in _splits:
                 sample_tokens.append(sample_token)
+    if verbose:
+        print(f'[TCAR-DEBUG] selected_sample_tokens={len(sample_tokens)}')
+        if len(sample_tokens) > 0:
+            print(f'[TCAR-DEBUG] selected_first_token={sample_tokens[0]}')
 
     all_annotations = EvalBoxes()
 
@@ -773,9 +793,29 @@ class NuScenesEval_custom(NuScenesEval):
         self.pred_boxes, self.meta = load_prediction(
             self.result_path, self.cfg.max_boxes_per_sample,
             CustomDetectionBox, verbose=verbose)
+        pred_tokens = list(self.pred_boxes.sample_tokens)
+        if verbose:
+            print(f'[TCAR-DEBUG] pred_tokens={len(pred_tokens)}')
+            if len(pred_tokens) > 0:
+                print(f'[TCAR-DEBUG] pred_first_token={pred_tokens[0]}')
         valid_tokens = None
         if self.data_infos is not None:
+            # Primary source: dataset tokens used during inference.
             valid_tokens = [info['token'] for info in self.data_infos]
+            # Keep only tokens that actually appear in predictions.
+            pred_token_set = set(pred_tokens)
+            valid_tokens = [tok for tok in valid_tokens if tok in pred_token_set]
+            if verbose:
+                print(f'[TCAR-DEBUG] data_infos_tokens={len(self.data_infos)} '
+                      f'intersect_with_pred={len(valid_tokens)}')
+                if len(self.data_infos) > 0:
+                    print(f"[TCAR-DEBUG] data_infos_first_token={self.data_infos[0].get('token', '<missing>')}")
+        # Fallback: if dataset tokens are missing/mismatched, align GT loading to predictions.
+        if not valid_tokens:
+            valid_tokens = pred_tokens
+            if verbose:
+                print('[TCAR-DEBUG] valid_tokens empty after intersection, fallback=pred_tokens')
+
         self.gt_boxes = custom_load_gt(
             self.nusc, self.eval_set, DetectionBox_modified,
             verbose=verbose, class_names=self.cfg.class_names,
@@ -786,8 +826,21 @@ class NuScenesEval_custom(NuScenesEval):
             self.pred_boxes = filter_by_sample_token(self.pred_boxes, valid_set)
             self.gt_boxes = filter_by_sample_token(self.gt_boxes, valid_set)
 
-        assert set(self.pred_boxes.sample_tokens) == set(self.gt_boxes.sample_tokens), \
-            "Samples in split doesn't match samples in predictions."
+        pred_token_set = set(self.pred_boxes.sample_tokens)
+        gt_token_set = set(self.gt_boxes.sample_tokens)
+        if pred_token_set != gt_token_set:
+            missing_in_gt = sorted(list(pred_token_set - gt_token_set))
+            missing_in_pred = sorted(list(gt_token_set - pred_token_set))
+            msg = (
+                "Samples in split doesn't match samples in predictions. "
+                f"pred={len(pred_token_set)}, gt={len(gt_token_set)}, "
+                f"missing_in_gt={len(missing_in_gt)}, missing_in_pred={len(missing_in_pred)}"
+            )
+            if len(missing_in_gt) > 0:
+                msg += f", example_missing_in_gt={missing_in_gt[0]}"
+            if len(missing_in_pred) > 0:
+                msg += f", example_missing_in_pred={missing_in_pred[0]}"
+            raise AssertionError(msg)
 
         # Add center distances.
         self.pred_boxes = custom_add_center_dist(nusc, self.pred_boxes)

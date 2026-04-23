@@ -2,6 +2,8 @@
 # modified from megvii-bevdepth.
 import math
 import os
+import re
+from glob import glob
 from copy import deepcopy
 
 import torch
@@ -67,11 +69,25 @@ class MEGVIIEMAHook(Hook):
     Detection/BEVDepth/blob/main/callbacks/ema.py.
     """
 
-    def __init__(self, init_updates=0, decay=0.9990, resume=None):
+    def __init__(self,
+                 init_updates=0,
+                 decay=0.9990,
+                 resume=None,
+                 save_ema=True,
+                 save_interval=1,
+                 save_epochs=None,
+                 max_keep_ckpts=-1):
         super().__init__()
         self.init_updates = init_updates
         self.resume = resume
         self.decay = decay
+        self.save_ema = save_ema
+        self.save_interval = int(save_interval)
+        if self.save_interval < 1:
+            raise ValueError('save_interval must be >= 1')
+        self.save_epochs = (set(int(e) for e in save_epochs)
+                            if save_epochs is not None else None)
+        self.max_keep_ckpts = int(max_keep_ckpts)
 
     def before_run(self, runner):
         from torch.nn.modules.batchnorm import SyncBatchNorm
@@ -100,17 +116,52 @@ class MEGVIIEMAHook(Hook):
         runner.ema_model.update(runner, runner.model.module)
 
     def after_train_epoch(self, runner):
-        self.save_checkpoint(runner)
+        epoch = runner.epoch + 1
+        if not self._should_save(epoch):
+            return
+        self.save_checkpoint(runner, epoch)
+        self.cleanup_old_checkpoints(runner)
+
+    def _should_save(self, epoch):
+        if not self.save_ema:
+            return False
+        if self.save_epochs is not None:
+            return epoch in self.save_epochs
+        return epoch % self.save_interval == 0
 
     @master_only
-    def save_checkpoint(self, runner):
+    def save_checkpoint(self, runner, epoch):
         state_dict = runner.ema_model.ema.state_dict()
         ema_checkpoint = {
             'epoch': runner.epoch,
             'state_dict': state_dict,
             'updates': runner.ema_model.updates
         }
-        save_path = f'epoch_{runner.epoch+1}_ema.pth'
+        save_path = f'epoch_{epoch}_ema.pth'
         save_path = os.path.join(runner.work_dir, save_path)
         torch.save(ema_checkpoint, save_path)
         runner.logger.info(f'Saving ema checkpoint at {save_path}')
+
+    @master_only
+    def cleanup_old_checkpoints(self, runner):
+        if self.max_keep_ckpts <= 0:
+            return
+        ckpts = self._find_ema_checkpoints(runner.work_dir)
+        if len(ckpts) <= self.max_keep_ckpts:
+            return
+        for _, ckpt_path in ckpts[:-self.max_keep_ckpts]:
+            if os.path.exists(ckpt_path):
+                os.remove(ckpt_path)
+                runner.logger.info(f'Removed old ema checkpoint {ckpt_path}')
+
+    def _find_ema_checkpoints(self, work_dir):
+        pattern = os.path.join(work_dir, 'epoch_*_ema.pth')
+        epoch_pattern = re.compile(r'epoch_(\d+)_ema\.pth$')
+        checkpoints = []
+        for ckpt_path in glob(pattern):
+            match = epoch_pattern.search(os.path.basename(ckpt_path))
+            if match is None:
+                continue
+            checkpoints.append((int(match.group(1)), ckpt_path))
+        checkpoints.sort(key=lambda x: x[0])
+        return checkpoints

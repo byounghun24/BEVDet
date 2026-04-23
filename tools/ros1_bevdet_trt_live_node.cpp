@@ -1,7 +1,8 @@
 #include <ros/ros.h>
+#include <sensor_msgs/Image.h>
+#include <sensor_msgs/CameraInfo.h>
 #include <vision_msgs/Detection3DArray.h>
 #include <geometry_msgs/Quaternion.h>
-#include <xmlrpcpp/XmlRpcValue.h>
 
 #include <algorithm>
 #include <cmath>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <opencv2/opencv.hpp>
+#include <cv_bridge/cv_bridge.h>
 
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
@@ -143,14 +145,8 @@ inline int parseOutputIndex(const std::string& name) {
 }
 
 inline std::vector<int> defaultTaskClassNums() {
+  // nuScenes/BEVDet 기본 task 분할
   return {1, 2, 2, 1, 2, 2};
-}
-
-inline std::vector<std::string> defaultCamNames() {
-  return {
-    "CAM_FRONT_LEFT", "CAM_FRONT", "CAM_FRONT_RIGHT",
-    "CAM_BACK_LEFT", "CAM_BACK", "CAM_BACK_RIGHT"
-  };
 }
 
 }  // namespace
@@ -161,9 +157,9 @@ public:
     nh.param<std::string>("engine_path", engine_path_, "tensorrt/bevdet_dynamic_fp16_fuse.engine");
     nh.param<std::string>("trtexec_input_dir", trtexec_input_dir_, "tensorrt/trtexec_inputs");
     nh.param<std::string>("trt_plugin_path", trt_plugin_path_, "");
-    nh.param<std::string>("dataset_root", dataset_root_, "/data/nuscenes");
+    nh.param<std::string>("image_topic", image_topic_, "/camera/image_raw");
+    nh.param<std::string>("camera_info_topic", cam_info_topic_, "/camera/camera_info");
     nh.param<std::string>("output_topic", output_topic_, "/bevdet/detections");
-    nh.param<std::string>("frame_id", frame_id_, "nuscenes");
 
     nh.param<int>("input_width", input_w_, 704);
     nh.param<int>("input_height", input_h_, 256);
@@ -173,11 +169,6 @@ public:
     nh.param<int>("crop_width", crop_w_, 0);
     nh.param<int>("crop_height", crop_h_, 0);
     nh.param<bool>("to_rgb", to_rgb_, true);
-
-    nh.param<double>("playback_hz", playback_hz_, 10.0);
-    nh.param<int>("start_index", frame_idx_, 0);
-    nh.param<int>("frame_stride", frame_stride_, 1);
-    nh.param<bool>("loop_dataset", loop_dataset_, true);
 
     nh.param<float>("score_threshold", score_threshold_, 0.1f);
     nh.param<float>("nms_iou_threshold", nms_iou_threshold_, 0.2f);
@@ -219,23 +210,15 @@ public:
       nms_rescale_factor_.assign(scale_factors.begin(), scale_factors.end());
     }
 
-    if (!loadCameraNames(nh)) {
-      throw std::runtime_error("Failed to parse camera_names parameter");
-    }
-    if (!buildNuScenesImageIndex()) {
-      throw std::runtime_error("Failed to build nuScenes image index");
-    }
-
     if (!initTrt()) {
       throw std::runtime_error("Failed to initialize TensorRT runtime");
     }
 
+    img_sub_ = nh.subscribe(image_topic_, 1, &BevDetTrtNode::onImage, this);
+    cam_info_sub_ = nh.subscribe(cam_info_topic_, 1, &BevDetTrtNode::onCamInfo, this);
     det_pub_ = nh.advertise<vision_msgs::Detection3DArray>(output_topic_, 1);
-    timer_ = nh.createTimer(ros::Duration(1.0 / std::max(1e-3, playback_hz_)),
-                            &BevDetTrtNode::onTimer, this);
 
-    ROS_INFO("BEVDet TRT nuScenes node ready. root=%s, frames=%zu",
-             dataset_root_.c_str(), frame_count_);
+    ROS_INFO("BEVDet TRT node ready. engine=%s", engine_path_.c_str());
   }
 
   ~BevDetTrtNode() {
@@ -266,72 +249,6 @@ public:
   }
 
 private:
-  bool loadCameraNames(ros::NodeHandle& nh) {
-    cam_names_ = defaultCamNames();
-    XmlRpc::XmlRpcValue v;
-    if (!nh.getParam("camera_names", v)) {
-      if (num_cams_ != static_cast<int>(cam_names_.size())) {
-        cam_names_.resize(num_cams_);
-      }
-      return true;
-    }
-    if (v.getType() != XmlRpc::XmlRpcValue::TypeArray || v.size() <= 0) {
-      ROS_ERROR("camera_names must be a non-empty array of strings");
-      return false;
-    }
-    cam_names_.clear();
-    for (int i = 0; i < v.size(); ++i) {
-      if (v[i].getType() != XmlRpc::XmlRpcValue::TypeString) {
-        ROS_ERROR("camera_names[%d] is not string", i);
-        return false;
-      }
-      cam_names_.push_back(static_cast<std::string>(v[i]));
-    }
-    num_cams_ = static_cast<int>(cam_names_.size());
-    return true;
-  }
-
-  bool buildNuScenesImageIndex() {
-    cam_image_paths_.clear();
-    cam_image_paths_.resize(cam_names_.size());
-
-    for (size_t c = 0; c < cam_names_.size(); ++c) {
-      std::vector<cv::String> paths;
-      cv::glob(dataset_root_ + "/samples/" + cam_names_[c] + "/*.jpg", paths, false);
-      if (paths.empty()) {
-        cv::glob(dataset_root_ + "/samples/" + cam_names_[c] + "/*.png", paths, false);
-      }
-      std::sort(paths.begin(), paths.end());
-
-      for (const auto& p : paths) {
-        cam_image_paths_[c].push_back(std::string(p));
-      }
-
-      ROS_INFO("Camera %s: %zu frames", cam_names_[c].c_str(), cam_image_paths_[c].size());
-      if (cam_image_paths_[c].empty()) {
-        ROS_ERROR("No images found for camera %s under %s/samples/%s",
-                  cam_names_[c].c_str(), dataset_root_.c_str(), cam_names_[c].c_str());
-        return false;
-      }
-    }
-
-    frame_count_ = cam_image_paths_[0].size();
-    for (size_t c = 1; c < cam_image_paths_.size(); ++c) {
-      frame_count_ = std::min(frame_count_, cam_image_paths_[c].size());
-    }
-    if (frame_count_ == 0) {
-      ROS_ERROR("frame_count became zero after aligning camera folders");
-      return false;
-    }
-    if (frame_idx_ < 0) {
-      frame_idx_ = 0;
-    }
-    if (static_cast<size_t>(frame_idx_) >= frame_count_) {
-      frame_idx_ = 0;
-    }
-    return true;
-  }
-
   bool maybeLoadPlugin() {
     std::vector<std::string> candidates;
     if (!trt_plugin_path_.empty()) {
@@ -419,12 +336,15 @@ private:
     if (!loadStaticInputBins()) {
       return false;
     }
+
     if (!setInputShapes()) {
       return false;
     }
+
     if (!allocateBindings()) {
       return false;
     }
+
     if (!uploadStaticInputs()) {
       return false;
     }
@@ -435,22 +355,24 @@ private:
       return false;
     }
     img_binding_idx_ = img_idx_it->second;
-    img_host_nchw_.resize(static_cast<size_t>(num_cams_) * 3U *
-                          static_cast<size_t>(input_h_) * static_cast<size_t>(input_w_));
+    img_host_nchw_.resize(static_cast<size_t>(num_cams_) * 3U * static_cast<size_t>(input_h_) * static_cast<size_t>(input_w_));
 
     if (!prepareOutputOrder()) {
       return false;
     }
+
     return true;
   }
 
   bool prepareOutputOrder() {
-    std::vector<std::pair<int, int>> ordered;
+    std::vector<std::pair<int, int>> ordered;  // (output_number, binding_idx)
     for (int idx : output_binding_indices_) {
       int n = parseOutputIndex(binding_names_[idx]);
-      if (n >= 0) {
-        ordered.emplace_back(n, idx);
+      if (n < 0) {
+        ROS_WARN("Output binding name is not output_N pattern: %s", binding_names_[idx].c_str());
+        continue;
       }
+      ordered.emplace_back(n, idx);
     }
     if (ordered.empty()) {
       ROS_ERROR("No output_N style output bindings found.");
@@ -464,6 +386,11 @@ private:
     ordered_output_bindings_.clear();
     for (const auto& p : ordered) {
       ordered_output_bindings_.push_back(p.second);
+    }
+
+    if (ordered_output_bindings_.size() % 6 != 0) {
+      ROS_WARN("Output count (%zu) is not multiple of 6. Decode may fail.",
+               ordered_output_bindings_.size());
     }
 
     ROS_INFO("Detected %zu output bindings (ordered by output_N).", ordered_output_bindings_.size());
@@ -493,6 +420,7 @@ private:
     std::vector<int32_t> values(raw.size() / sizeof(int32_t));
     std::memcpy(values.data(), raw.data(), raw.size());
     static_int_inputs_[name] = std::move(values);
+    ROS_INFO("Loaded %s (%zu int32)", path.c_str(), static_int_inputs_[name].size());
     return true;
   }
 
@@ -500,17 +428,20 @@ private:
     if (!setInputShape("img", nvinfer1::Dims4(num_cams_, 3, input_h_, input_w_))) {
       return false;
     }
+
     if (!setInputShapeFromData("ranks_depth")) return false;
     if (!setInputShapeFromData("ranks_feat")) return false;
     if (!setInputShapeFromData("ranks_bev")) return false;
     if (!setInputShapeFromData("interval_starts")) return false;
     if (!setInputShapeFromData("interval_lengths")) return false;
+
     return true;
   }
 
   bool setInputShapeFromData(const std::string& name) {
     const auto it = static_int_inputs_.find(name);
     if (it == static_int_inputs_.end()) {
+      ROS_ERROR("Missing host input data for %s", name.c_str());
       return false;
     }
     nvinfer1::Dims dims;
@@ -522,9 +453,14 @@ private:
   bool setInputShape(const std::string& name, const nvinfer1::Dims& dims) {
     auto it = binding_name_to_idx_.find(name);
     if (it == binding_name_to_idx_.end()) {
+      ROS_ERROR("Binding not found: %s", name.c_str());
       return false;
     }
-    return context_->setBindingDimensions(it->second, dims);
+    if (!context_->setBindingDimensions(it->second, dims)) {
+      ROS_ERROR("setBindingDimensions failed for %s", name.c_str());
+      return false;
+    }
+    return true;
   }
 
   bool allocateBindings() {
@@ -533,17 +469,20 @@ private:
       const nvinfer1::Dims dims = context_->getBindingDimensions(i);
       const int64_t vol = volume(dims);
       if (vol <= 0) {
+        ROS_ERROR("Unresolved binding shape for index=%d name=%s", i, engine_->getBindingName(i));
         return false;
       }
 
       const nvinfer1::DataType dtype = engine_->getBindingDataType(i);
       const size_t bytes = static_cast<size_t>(vol) * elementSize(dtype);
       if (bytes == 0) {
+        ROS_ERROR("Unsupported binding dtype at index=%d name=%s", i, engine_->getBindingName(i));
         return false;
       }
 
       void* device_ptr = nullptr;
       if (cudaMalloc(&device_ptr, bytes) != cudaSuccess) {
+        ROS_ERROR("cudaMalloc failed for binding %s", engine_->getBindingName(i));
         return false;
       }
       bindings_[i] = device_ptr;
@@ -553,6 +492,8 @@ private:
       if (!engine_->bindingIsInput(i)) {
         output_host_buffers_[i].resize(bytes);
       }
+
+      ROS_INFO("Binding %-18s idx=%d bytes=%zu", engine_->getBindingName(i), i, bytes);
     }
     return true;
   }
@@ -561,11 +502,13 @@ private:
     for (const auto& kv : static_int_inputs_) {
       const auto idx_it = binding_name_to_idx_.find(kv.first);
       if (idx_it == binding_name_to_idx_.end()) {
+        ROS_ERROR("Binding missing while uploading: %s", kv.first.c_str());
         return false;
       }
       const int idx = idx_it->second;
       const size_t bytes = kv.second.size() * sizeof(int32_t);
       if (cudaMemcpy(bindings_[idx], kv.second.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        ROS_ERROR("cudaMemcpy failed for static input %s", kv.first.c_str());
         return false;
       }
     }
@@ -576,7 +519,8 @@ private:
     const auto& raw = output_host_buffers_.at(binding_idx);
     const size_t elem_sz = elementSize(binding_dtypes_[binding_idx]);
     const size_t n = raw.size() / elem_sz;
-    std::vector<float> out(n, 0.0f);
+    std::vector<float> out;
+    out.resize(n);
 
     if (binding_dtypes_[binding_idx] == nvinfer1::DataType::kFLOAT) {
       std::memcpy(out.data(), raw.data(), raw.size());
@@ -587,30 +531,41 @@ private:
       for (size_t i = 0; i < n; ++i) {
         out[i] = __half2float(p[i]);
       }
+      return out;
     }
+
+    ROS_WARN_THROTTLE(1.0, "Unsupported output dtype for decode on binding idx=%d", binding_idx);
+    std::fill(out.begin(), out.end(), 0.0f);
     return out;
   }
 
   bool decodeOutputs(std::vector<BoxPred>* out_boxes) {
     out_boxes->clear();
-    if (ordered_output_bindings_.empty() || (ordered_output_bindings_.size() % 6 != 0)) {
+    if (ordered_output_bindings_.empty()) {
+      return false;
+    }
+    if (ordered_output_bindings_.size() % 6 != 0) {
       return false;
     }
 
     const size_t task_count = ordered_output_bindings_.size() / 6;
+
     std::vector<int> task_class_nums = task_class_nums_;
     if (task_class_nums.size() != task_count) {
       task_class_nums.clear();
       for (size_t t = 0; t < task_count; ++t) {
         const int heat_idx = ordered_output_bindings_[t * 6 + 5];
         const nvinfer1::Dims d = binding_dims_[heat_idx];
-        task_class_nums.push_back((d.nbDims >= 2) ? std::max(1, d.d[1]) : 1);
+        int c = (d.nbDims >= 2) ? d.d[1] : 1;
+        task_class_nums.push_back(std::max(1, c));
       }
+      ROS_WARN_THROTTLE(5.0, "task_class_nums size mismatch. Using heatmap channels from engine outputs.");
     }
 
     int class_total = std::accumulate(task_class_nums.begin(), task_class_nums.end(), 0);
     if (nms_rescale_factor_.size() != static_cast<size_t>(class_total)) {
       nms_rescale_factor_.assign(static_cast<size_t>(class_total), 1.0f);
+      ROS_WARN_THROTTLE(5.0, "nms_rescale_factor size mismatch. Fallback to all ones.");
     }
 
     int class_offset = 0;
@@ -624,6 +579,7 @@ private:
 
       const nvinfer1::Dims hm_dims = binding_dims_[hm_idx];
       if (hm_dims.nbDims != 4) {
+        ROS_WARN_THROTTLE(1.0, "Unexpected heatmap dims for task %zu", t);
         class_offset += task_class_nums[t];
         continue;
       }
@@ -653,19 +609,22 @@ private:
           }
         }
         const float score = sigmoid(best_logit);
-        if (score < score_threshold_) continue;
+        if (score < score_threshold_) {
+          continue;
+        }
 
         const int gy = idx / w;
         const int gx = idx % w;
         const int cls = class_offset + best_cls;
+        const float scale = nms_rescale_factor_[cls];
 
         BoxPred box;
         box.x = (reg[0 * map_size + idx] + static_cast<float>(gx)) * x_step_ + x_start_;
         box.y = (reg[1 * map_size + idx] + static_cast<float>(gy)) * y_step_ + y_start_;
         box.z = hei[idx];
-        box.l = std::exp(dim[0 * map_size + idx]) * nms_rescale_factor_[cls];
-        box.w = std::exp(dim[1 * map_size + idx]) * nms_rescale_factor_[cls];
-        box.h = std::exp(dim[2 * map_size + idx]) * nms_rescale_factor_[cls];
+        box.l = std::exp(dim[0 * map_size + idx]) * scale;
+        box.w = std::exp(dim[1 * map_size + idx]) * scale;
+        box.h = std::exp(dim[2 * map_size + idx]) * scale;
         box.yaw = std::atan2(rot[idx], rot[map_size + idx]);
         box.vx = vel[idx];
         box.vy = vel[map_size + idx];
@@ -687,19 +646,25 @@ private:
       for (const auto& cand : task_boxes) {
         bool drop = false;
         for (const auto& prev : kept) {
-          if (cand.label != prev.label) continue;
+          if (cand.label != prev.label) {
+            continue;
+          }
           if (iouAabbBev(cand, prev) > nms_iou_threshold_) {
             drop = true;
             break;
           }
         }
         if (!drop) {
+          // decode 단계에서 곱했던 scale을 복원
+          const float scale_restore = nms_rescale_factor_[cand.label];
           BoxPred b = cand;
-          b.l /= nms_rescale_factor_[cand.label];
-          b.w /= nms_rescale_factor_[cand.label];
-          b.h /= nms_rescale_factor_[cand.label];
+          b.l /= scale_restore;
+          b.w /= scale_restore;
+          b.h /= scale_restore;
           kept.push_back(b);
-          if (static_cast<int>(kept.size()) >= nms_post_max_) break;
+          if (static_cast<int>(kept.size()) >= nms_post_max_) {
+            break;
+          }
         }
       }
 
@@ -726,12 +691,11 @@ private:
     return q;
   }
 
-  void publishDetections(const std::vector<BoxPred>& boxes, int frame_idx) {
+  void publishDetections(const std::vector<BoxPred>& boxes, const std_msgs::Header& header) {
     vision_msgs::Detection3DArray msg;
-    msg.header.stamp = ros::Time::now();
-    msg.header.frame_id = frame_id_;
-    msg.detections.reserve(boxes.size());
+    msg.header = header;
 
+    msg.detections.reserve(boxes.size());
     for (const auto& b : boxes) {
       vision_msgs::Detection3D det;
       det.bbox.center.position.x = b.x;
@@ -745,77 +709,54 @@ private:
     }
 
     det_pub_.publish(msg);
-    ROS_INFO_STREAM_THROTTLE(1.0, "Published frame=" << frame_idx << " boxes=" << boxes.size());
   }
 
-  bool preprocessFrame(int frame_idx) {
-    const size_t image_plane = static_cast<size_t>(input_h_) * static_cast<size_t>(input_w_);
-    for (int cam = 0; cam < num_cams_; ++cam) {
-      const std::string& path = cam_image_paths_[cam][static_cast<size_t>(frame_idx)];
-      cv::Mat src = cv::imread(path, cv::IMREAD_COLOR);
-      if (src.empty()) {
-        ROS_ERROR("Failed to read image: %s", path.c_str());
-        return false;
-      }
-
-      cv::Mat resized = src;
-      if (src.cols != input_w_ || src.rows != input_h_) {
-        cv::resize(src, resized, cv::Size(input_w_, input_h_), 0.0, 0.0, cv::INTER_LINEAR);
-      }
-
-      cv::Rect roi(0, 0, resized.cols, resized.rows);
-      if (crop_w_ > 0 && crop_h_ > 0) {
-        const int x = std::max(0, crop_x_);
-        const int y = std::max(0, crop_y_);
-        const int w = std::min(crop_w_, resized.cols - x);
-        const int h = std::min(crop_h_, resized.rows - y);
-        if (w > 0 && h > 0) {
-          roi = cv::Rect(x, y, w, h);
-        }
-      }
-
-      cv::Mat cropped = resized(roi);
-      if (cropped.cols != input_w_ || cropped.rows != input_h_) {
-        cv::resize(cropped, cropped, cv::Size(input_w_, input_h_), 0.0, 0.0, cv::INTER_LINEAR);
-      }
-
-      cv::Mat f32;
-      cropped.convertTo(f32, CV_32FC3);
-      if (to_rgb_) {
-        cv::cvtColor(f32, f32, cv::COLOR_BGR2RGB);
-      }
-      cv::subtract(f32, mean_, f32);
-      cv::multiply(f32, inv_std_, f32);
-
-      const float* src_ptr = reinterpret_cast<const float*>(f32.data);
-      float* dst_cam = img_host_nchw_.data() + static_cast<size_t>(cam) * 3U * image_plane;
-      float* dst_c0 = dst_cam;
-      float* dst_c1 = dst_cam + image_plane;
-      float* dst_c2 = dst_cam + image_plane * 2U;
-      for (size_t i = 0; i < image_plane; ++i) {
-        dst_c0[i] = src_ptr[i * 3 + 0];
-        dst_c1[i] = src_ptr[i * 3 + 1];
-        dst_c2[i] = src_ptr[i * 3 + 2];
-      }
-    }
-    return true;
+  void onCamInfo(const sensor_msgs::CameraInfoConstPtr& msg) {
+    last_cam_info_ = *msg;
+    has_cam_info_ = true;
   }
 
-  void onTimer(const ros::TimerEvent&) {
-    if (frame_count_ == 0) {
+  void onImage(const sensor_msgs::ImageConstPtr& msg) {
+    if (!has_cam_info_) {
+      ROS_WARN_THROTTLE(5.0, "Waiting for camera info...");
       return;
-    }
-    if (frame_idx_ < 0 || static_cast<size_t>(frame_idx_) >= frame_count_) {
-      if (!loop_dataset_) {
-        ROS_INFO_THROTTLE(5.0, "Reached end of nuScenes playback.");
-        return;
-      }
-      frame_idx_ = 0;
     }
 
-    const int cur = frame_idx_;
-    if (!preprocessFrame(cur)) {
+    cv_bridge::CvImageConstPtr cv_ptr;
+    try {
+      cv_ptr = cv_bridge::toCvShare(msg, "bgr8");
+    } catch (const cv_bridge::Exception& e) {
+      ROS_ERROR("cv_bridge error: %s", e.what());
       return;
+    }
+
+    const cv::Mat& src = cv_ptr->image;
+    cv::Mat resized = src;
+    if (input_w_ > 0 && input_h_ > 0 &&
+        (src.cols != input_w_ || src.rows != input_h_)) {
+      resized_buf_.create(input_h_, input_w_, src.type());
+      cv::resize(src, resized_buf_, cv::Size(input_w_, input_h_), 0.0, 0.0, cv::INTER_LINEAR);
+      resized = resized_buf_;
+    }
+
+    cv::Rect roi(0, 0, resized.cols, resized.rows);
+    if (crop_w_ > 0 && crop_h_ > 0) {
+      const int x = std::max(0, crop_x_);
+      const int y = std::max(0, crop_y_);
+      const int w = std::min(crop_w_, resized.cols - x);
+      const int h = std::min(crop_h_, resized.rows - y);
+      if (w > 0 && h > 0) {
+        roi = cv::Rect(x, y, w, h);
+      }
+    }
+
+    const cv::Mat cropped = resized(roi);
+    if (cropped.cols != input_w_ || cropped.rows != input_h_) {
+      crop_resized_buf_.create(input_h_, input_w_, cropped.type());
+      cv::resize(cropped, crop_resized_buf_, cv::Size(input_w_, input_h_), 0.0, 0.0, cv::INTER_LINEAR);
+      preprocessToNchw(crop_resized_buf_);
+    } else {
+      preprocessToNchw(cropped);
     }
 
     const size_t img_bytes = img_host_nchw_.size() * sizeof(float);
@@ -826,13 +767,17 @@ private:
     }
 
     const ros::WallTime t0 = ros::WallTime::now();
-    if (!context_->enqueueV2(bindings_.data(), stream_, nullptr)) {
+    const bool ok = context_->enqueueV2(bindings_.data(), stream_, nullptr);
+    if (!ok) {
       ROS_ERROR_THROTTLE(1.0, "TensorRT enqueueV2 failed");
       return;
     }
 
     for (int idx : output_binding_indices_) {
       const size_t bytes = output_host_buffers_[idx].size();
+      if (bytes == 0) {
+        continue;
+      }
       if (cudaMemcpyAsync(output_host_buffers_[idx].data(), bindings_[idx], bytes,
                           cudaMemcpyDeviceToHost, stream_) != cudaSuccess) {
         ROS_ERROR_THROTTLE(1.0, "cudaMemcpyAsync failed for output idx=%d", idx);
@@ -844,6 +789,7 @@ private:
       ROS_ERROR_THROTTLE(1.0, "cudaStreamSynchronize failed");
       return;
     }
+    const double dt_ms = (ros::WallTime::now() - t0).toSec() * 1000.0;
 
     std::vector<BoxPred> boxes;
     if (!decodeOutputs(&boxes)) {
@@ -851,19 +797,43 @@ private:
       return;
     }
 
-    const double dt_ms = (ros::WallTime::now() - t0).toSec() * 1000.0;
     ROS_INFO_STREAM_THROTTLE(1.0, "TRT latency=" << dt_ms << " ms, boxes=" << boxes.size());
-    publishDetections(boxes, cur);
+    publishDetections(boxes, msg->header);
+  }
 
-    frame_idx_ += std::max(1, frame_stride_);
+  void preprocessToNchw(const cv::Mat& bgr) {
+    last_preprocessed_.create(bgr.rows, bgr.cols, CV_32FC3);
+    bgr.convertTo(last_preprocessed_, CV_32FC3);
+    if (to_rgb_) {
+      cv::cvtColor(last_preprocessed_, last_preprocessed_, cv::COLOR_BGR2RGB);
+    }
+    cv::subtract(last_preprocessed_, mean_, last_preprocessed_);
+    cv::multiply(last_preprocessed_, inv_std_, last_preprocessed_);
+
+    const int h = last_preprocessed_.rows;
+    const int w = last_preprocessed_.cols;
+    const size_t image_plane = static_cast<size_t>(h) * static_cast<size_t>(w);
+    const float* src = reinterpret_cast<const float*>(last_preprocessed_.data);
+
+    for (int cam = 0; cam < num_cams_; ++cam) {
+      float* dst_cam = img_host_nchw_.data() + static_cast<size_t>(cam) * 3U * image_plane;
+      float* dst_c0 = dst_cam;
+      float* dst_c1 = dst_cam + image_plane;
+      float* dst_c2 = dst_cam + 2U * image_plane;
+      for (size_t i = 0; i < image_plane; ++i) {
+        dst_c0[i] = src[i * 3 + 0];
+        dst_c1[i] = src[i * 3 + 1];
+        dst_c2[i] = src[i * 3 + 2];
+      }
+    }
   }
 
   std::string engine_path_;
   std::string trtexec_input_dir_;
   std::string trt_plugin_path_;
-  std::string dataset_root_;
+  std::string image_topic_;
+  std::string cam_info_topic_;
   std::string output_topic_;
-  std::string frame_id_;
 
   int input_w_ = 0;
   int input_h_ = 0;
@@ -873,11 +843,6 @@ private:
   int crop_w_ = 0;
   int crop_h_ = 0;
   bool to_rgb_ = true;
-
-  double playback_hz_ = 10.0;
-  int frame_idx_ = 0;
-  int frame_stride_ = 1;
-  bool loop_dataset_ = true;
 
   float score_threshold_ = 0.1f;
   float nms_iou_threshold_ = 0.2f;
@@ -890,15 +855,19 @@ private:
 
   std::vector<int> task_class_nums_;
   std::vector<float> nms_rescale_factor_;
-  std::vector<std::string> cam_names_;
-  std::vector<std::vector<std::string>> cam_image_paths_;
-  size_t frame_count_ = 0;
 
   cv::Scalar mean_;
   cv::Scalar inv_std_;
+  cv::Mat resized_buf_;
+  cv::Mat crop_resized_buf_;
+  cv::Mat last_preprocessed_;
 
+  ros::Subscriber img_sub_;
+  ros::Subscriber cam_info_sub_;
   ros::Publisher det_pub_;
-  ros::Timer timer_;
+
+  sensor_msgs::CameraInfo last_cam_info_;
+  bool has_cam_info_ = false;
 
   TrtLogger logger_;
   nvinfer1::IRuntime* runtime_ = nullptr;

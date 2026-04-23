@@ -1,19 +1,22 @@
 _base_ = ['./bevdet-r50.py']
 
 dataset_type = 'TcarDataset'
-# Update this if your TCAR dataset is stored elsewhere.
 data_root = 'data/tcar/'
 
-# Save checkpoints/logs under ./outputs instead of work_dirs.
-# Use a timestamped subdir to avoid overwriting previous runs.
 import time as _time
 _run_id = _time.strftime('%Y%m%d_%H%M%S')
-work_dir = f'./outputs_bh/bevdet-r50-tcar/run_{_run_id}'
+work_dir = f'./outputs_bh/bevdet-r50-tcar-5030/run_{_run_id}'
 
-# Point cloud range is referenced in the train pipeline.
-point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+# BEV range: x(front/back) +-50m, y(left/right) +-30m.
+point_cloud_range = [-50.0, -30.0, -5.0, 50.0, 30.0, 3.0]
+grid_config = {
+    'x': [-50.0, 50.0, 0.8],
+    'y': [-30.0, 30.0, 0.8],
+    'z': [-5.0, 3.0, 8.0],
+    'depth': [1.0, 60.0, 1.0],
+}
+voxel_size = [0.1, 0.1, 0.2]
 
-# Copy base data configs used in pipelines.
 data_config = {
     'cams': [
         'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT',
@@ -37,10 +40,8 @@ bda_aug_conf = dict(
     flip_dx_ratio=0.5,
     flip_dy_ratio=0.5)
 
-# TCAR classes (from gt_names mapping).
 class_names = ['car', 'truck', 'cyc', 'ped']
 
-# Override dataset settings to use TCAR infos.
 data = dict(
     train=dict(
         type=dataset_type,
@@ -59,7 +60,6 @@ data = dict(
         classes=class_names),
 )
 
-# TCAR train pipeline (match BEVDet train behavior).
 train_pipeline = [
     dict(
         type='PrepareImageInputs',
@@ -80,14 +80,15 @@ train_pipeline = [
         keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d']),
 ]
 
-# TCAR test pipeline (robust point loading).
 test_pipeline = [
     dict(type='PrepareImageInputs', data_config=data_config),
     dict(type='LoadAnnotations'),
-    dict(type='BEVAug',
-         bda_aug_conf=bda_aug_conf,
-         classes=class_names,
-         is_train=False),
+    dict(
+        type='BEVAug',
+        bda_aug_conf=bda_aug_conf,
+        classes=class_names,
+        is_train=False),
+    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(
         type='LoadPointsFromFileTCAR',
         coord_type='LIDAR',
@@ -108,27 +109,33 @@ test_pipeline = [
         ])
 ]
 
-# Apply TCAR pipelines.
 data['train'].update(dict(pipeline=train_pipeline))
 data['val'].update(dict(pipeline=test_pipeline))
 data['test'].update(dict(pipeline=test_pipeline))
 
-# Update model head for TCAR classes.
 model = dict(
+    img_view_transformer=dict(grid_config=grid_config),
     pts_bbox_head=dict(
         tasks=[
             dict(num_class=4, class_names=class_names),
         ],
-    ),
+        bbox_coder=dict(
+            pc_range=point_cloud_range[:2],
+            post_center_range=[-50.0, -30.0, -10.0, 50.0, 30.0, 10.0])),
+    train_cfg=dict(
+        pts=dict(
+            point_cloud_range=point_cloud_range,
+            grid_size=[1000, 600, 40],
+            voxel_size=voxel_size)),
     test_cfg=dict(
         pts=dict(
+            pc_range=point_cloud_range[:2],
+            post_center_limit_range=[-50.0, -30.0, -10.0, 50.0, 30.0, 10.0],
+            voxel_size=voxel_size[:2],
             min_radius=[4, 10, 1.1, 0.85],
             nms_rescale_factor=[[1.0, 0.7, 1.0, 0.55]],
-        )
-    )
-)
+        )))
 
-# Enable Weights & Biases logging.
 log_config = dict(
     interval=50,
     hooks=[
@@ -137,10 +144,9 @@ log_config = dict(
             type='WandbLoggerHook',
             init_kwargs=dict(
                 project='bevdet',
-                name='bevdet-r50-tcar'))
+                name='bevdet-r50-tcar-5030'))
     ])
 
-# Save checkpoints only at specific epochs.
 checkpoint_config = None
 custom_hooks = [
     dict(

@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import os
+import pickle
 
 import cv2
 import mmcv
@@ -847,6 +848,169 @@ class PointToMultiViewDepth(object):
 
 
 @PIPELINES.register_module()
+class LoadTeacherDepthFromNPZ(object):
+    """Load offline teacher depth maps exported in stage1.
+
+    Expected index file format: dict[sample_data_token] -> record dict
+    containing ``depth_relpath``.
+    """
+
+    def __init__(self,
+                 depth_root,
+                 index_file=None,
+                 depth_key='depth',
+                 output_key='teacher_depth',
+                 apply_img_aug=True,
+                 ignore_missing=False,
+                 fill_value=0.0):
+        self.depth_root = os.path.abspath(depth_root)
+        self.index_file = index_file
+        if self.index_file is None:
+            self.index_file = os.path.join(self.depth_root, 'index_by_token.pkl')
+        self.index_file = os.path.abspath(self.index_file)
+        self.depth_key = depth_key
+        self.output_key = output_key
+        self.apply_img_aug = apply_img_aug
+        self.ignore_missing = ignore_missing
+        self.fill_value = float(fill_value)
+        self._index = None
+
+    def _load_index(self):
+        if self._index is None:
+            if not os.path.exists(self.index_file):
+                raise FileNotFoundError(
+                    f'Offline depth index not found: {self.index_file}')
+            with open(self.index_file, 'rb') as f:
+                self._index = pickle.load(f)
+            if not isinstance(self._index, dict):
+                raise TypeError('Offline depth index must be dict[token]->record')
+        return self._index
+
+    def _resolve_depth_path(self, rec):
+        rel = rec.get('depth_relpath', None)
+        if rel is None:
+            raise KeyError('depth_relpath missing in offline depth record')
+        if os.path.isabs(rel):
+            return rel
+        return os.path.join(self.depth_root, rel)
+
+    def _apply_aug(self, depth_map, aug):
+        resize_dims = tuple(int(v) for v in aug['resize_dims'])
+        crop = tuple(int(v) for v in aug['crop'])
+        flip = bool(aug['flip'])
+        rotate = float(aug['rotate'])
+        resize = float(aug.get('resize', 1.0))
+
+        # If offline depth source resolution differs from the raw camera image
+        # resolution used to sample aug params, rescale aug params accordingly.
+        src_h, src_w = depth_map.shape[:2]
+        eps = 1e-6
+        exp_w = int(round(resize_dims[0] / max(resize, eps)))
+        exp_h = int(round(resize_dims[1] / max(resize, eps)))
+        exp_w = max(exp_w, 1)
+        exp_h = max(exp_h, 1)
+        scale_x = float(src_w) / float(exp_w)
+        scale_y = float(src_h) / float(exp_h)
+        if abs(scale_x - 1.0) > 1e-3 or abs(scale_y - 1.0) > 1e-3:
+            resize_dims = (
+                max(1, int(round(resize_dims[0] * scale_x))),
+                max(1, int(round(resize_dims[1] * scale_y))),
+            )
+            crop = (
+                int(round(crop[0] * scale_x)),
+                int(round(crop[1] * scale_y)),
+                int(round(crop[2] * scale_x)),
+                int(round(crop[3] * scale_y)),
+            )
+            # Clamp crop to resized image bounds.
+            crop = (
+                max(0, min(crop[0], resize_dims[0] - 1)),
+                max(0, min(crop[1], resize_dims[1] - 1)),
+                max(1, min(crop[2], resize_dims[0])),
+                max(1, min(crop[3], resize_dims[1])),
+            )
+            if crop[2] <= crop[0]:
+                crop = (crop[0], crop[1], min(resize_dims[0], crop[0] + 1),
+                        crop[3])
+            if crop[3] <= crop[1]:
+                crop = (crop[0], crop[1], crop[2], min(resize_dims[1], crop[1] + 1))
+
+        depth_img = Image.fromarray(depth_map.astype(np.float32), mode='F')
+        depth_img = depth_img.resize(resize_dims, resample=Image.BILINEAR)
+        depth_img = depth_img.crop(crop)
+        if flip:
+            depth_img = depth_img.transpose(method=Image.FLIP_LEFT_RIGHT)
+        depth_img = depth_img.rotate(rotate, resample=Image.BILINEAR)
+        return np.asarray(depth_img, dtype=np.float32)
+
+    def __call__(self, results):
+        index = self._load_index()
+        cam_names = results.get('cam_names', [])
+        imgs = results['img_inputs'][0]
+        out_h, out_w = int(imgs.shape[-2]), int(imgs.shape[-1])
+        aug_list = results.get('img_aug_params', None)
+        if self.apply_img_aug and aug_list is None:
+            raise KeyError('img_aug_params missing in results. '
+                           'LoadTeacherDepthFromNPZ must run after '
+                           'PrepareImageInputs.')
+
+        teacher_depths = []
+        for cid, cam_name in enumerate(cam_names):
+            cam_info = results['curr']['cams'][cam_name]
+            sd_token = cam_info.get('sample_data_token', None)
+            if sd_token is None:
+                raise KeyError(
+                    f'sample_data_token missing for camera {cam_name}')
+
+            rec = index.get(sd_token, None)
+            if rec is None:
+                if self.ignore_missing:
+                    teacher_depths.append(
+                        torch.full((out_h, out_w),
+                                   self.fill_value,
+                                   dtype=torch.float32))
+                    continue
+                raise KeyError(f'Offline teacher depth missing for token {sd_token}')
+
+            npz_path = self._resolve_depth_path(rec)
+            if not os.path.exists(npz_path):
+                if self.ignore_missing:
+                    teacher_depths.append(
+                        torch.full((out_h, out_w),
+                                   self.fill_value,
+                                   dtype=torch.float32))
+                    continue
+                raise FileNotFoundError(npz_path)
+
+            arr = np.load(npz_path)
+            if self.depth_key not in arr:
+                if self.ignore_missing:
+                    teacher_depths.append(
+                        torch.full((out_h, out_w),
+                                   self.fill_value,
+                                   dtype=torch.float32))
+                    continue
+                raise KeyError(
+                    f'{self.depth_key} missing in offline depth file: {npz_path}')
+            depth_map = np.asarray(arr[self.depth_key], dtype=np.float32)
+            if depth_map.ndim != 2:
+                raise ValueError(
+                    f'Expected depth map [H, W], got {depth_map.shape} in {npz_path}')
+
+            if self.apply_img_aug:
+                depth_map = self._apply_aug(depth_map, aug_list[cid])
+            if depth_map.shape != (out_h, out_w):
+                depth_map = cv2.resize(
+                    depth_map, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            depth_map = np.where(np.isfinite(depth_map), depth_map, 0.0)
+            depth_map = np.maximum(depth_map, 0.0)
+            teacher_depths.append(torch.from_numpy(depth_map))
+
+        results[self.output_key] = torch.stack(teacher_depths, dim=0).float()
+        return results
+
+
+@PIPELINES.register_module()
 class PointToMultiViewDepthFusion(PointToMultiViewDepth):
     def __call__(self, results):
         points_camego_aug = results['points'].tensor[:, :3]
@@ -1109,6 +1273,7 @@ class PrepareImageInputs(object):
         intrins = []
         post_rots = []
         post_trans = []
+        img_aug_params = []
         cam_names = self.choose_cams()
         results['cam_names'] = cam_names
         canvas = []
@@ -1147,6 +1312,13 @@ class PrepareImageInputs(object):
 
             canvas.append(np.array(img))
             imgs.append(self.normalize_img(img))
+            img_aug_params.append(
+                dict(
+                    resize=resize,
+                    resize_dims=resize_dims,
+                    crop=crop,
+                    flip=bool(flip),
+                    rotate=rotate))
 
             if self.sequential:
                 assert 'adjacent' in results
@@ -1195,6 +1367,7 @@ class PrepareImageInputs(object):
         post_rots = torch.stack(post_rots)
         post_trans = torch.stack(post_trans)
         results['canvas'] = canvas
+        results['img_aug_params'] = img_aug_params
         return (imgs, sensor2egos, ego2globals, intrins, post_rots, post_trans)
 
     def __call__(self, results):

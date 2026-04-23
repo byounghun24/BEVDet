@@ -64,6 +64,8 @@ The latency includes Network/Post-Processing/Total. Training without CBGS is dep
 
 step 1. Please prepare environment as that in [Docker](docker/Dockerfile).
 
+> 이 저장소 작업은 Lecun 서버의 bevdet-trt:22.07 (bevdet_dev_v2) 컨테이너에서 진행하면 됩니다.
+
 step 2. Prepare bevdet repo by.
 ```shell script
 git clone https://github.com/HuangJunJie2017/BEVDet.git

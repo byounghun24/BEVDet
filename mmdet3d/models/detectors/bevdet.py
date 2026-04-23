@@ -1,13 +1,18 @@
 # Copyright (c) Phigent Robotics. All rights reserved.
+import os
+import sys
+
 import torch
 import torch.nn.functional as F
 from mmcv.runner import force_fp32
 
+from mmdet3d.core import draw_heatmap_gaussian, gaussian_radius
 from mmdet3d.ops.bev_pool_v2.bev_pool import TRTBEVPoolv2
 from mmdet.models import DETECTORS
 from .. import builder
 from .centerpoint import CenterPoint
 from mmdet3d.models.utils.grid_mask import GridMask
+from mmdet3d.models.utils import clip_sigmoid
 from mmdet.models.backbones.resnet import ResNet
 
 
@@ -40,13 +45,47 @@ class BEVDet(CenterPoint):
                 builder.build_backbone(img_bev_encoder_backbone)
             self.img_bev_encoder_neck = builder.build_neck(img_bev_encoder_neck)
 
+    def _get_expected_bev_hw(self):
+        """Get expected BEV feature map size from CenterPoint head configs."""
+        cfg = None
+        if hasattr(self, 'pts_bbox_head') and self.pts_bbox_head is not None:
+            cfg = getattr(self.pts_bbox_head, 'train_cfg', None) or \
+                getattr(self.pts_bbox_head, 'test_cfg', None)
+        if cfg is None:
+            return None
+        grid_size = cfg.get('grid_size', None)
+        out_size_factor = cfg.get('out_size_factor', None)
+        if grid_size is None or out_size_factor is None:
+            return None
+        # grid_size is [X, Y, Z], feature map is [H=Y/out, W=X/out].
+        target_w = int(grid_size[0] // out_size_factor)
+        target_h = int(grid_size[1] // out_size_factor)
+        return target_h, target_w
+
+    def _align_bev_feature_size(self, x):
+        """Align BEV feature size to head target for stable train/test shapes."""
+        expected_hw = self._get_expected_bev_hw()
+        if expected_hw is None:
+            return x
+        target_h, target_w = expected_hw
+        cur_h, cur_w = x.shape[-2:]
+        if cur_h == target_h and cur_w == target_w:
+            return x
+        # Keep origin-side alignment; trim extra border cells on max side.
+        x = x[..., :min(cur_h, target_h), :min(cur_w, target_w)]
+        pad_h = max(0, target_h - x.shape[-2])
+        pad_w = max(0, target_w - x.shape[-1])
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        return x
+
     def image_encoder(self, img, stereo=False):
         imgs = img
         B, N, C, imH, imW = imgs.shape
         imgs = imgs.view(B * N, C, imH, imW)
         if self.grid_mask is not None:
             imgs = self.grid_mask(imgs)
-        x = self.img_backbone(imgs)
+        x = self.img_backbone(imgs) # torch.Size([48, 1024, 16, 44])
         stereo_feat = None
         if stereo:
             stereo_feat = x[0]
@@ -65,6 +104,7 @@ class BEVDet(CenterPoint):
         x = self.img_bev_encoder_neck(x)
         if type(x) in [list, tuple]:
             x = x[0]
+        x = self._align_bev_feature_size(x)
         return x
 
     def prepare_inputs(self, inputs):
@@ -213,6 +253,301 @@ class BEVDet(CenterPoint):
         assert self.with_pts_bbox
         outs = self.pts_bbox_head(img_feats)
         return outs
+
+
+@DETECTORS.register_module()
+class BEVDetAux(BEVDet):
+    """BEVDet with an auxiliary 2D detection branch on image encoder features.
+
+    The branch projects 3D GT centers onto each camera image and supervises
+    a per-camera center head (heatmap + offset regression).
+    """
+
+    def __init__(self,
+                 aux_2d_head,
+                 aux_2d_train_cfg=None,
+                 aux_2d_loss_cls=dict(
+                     type='GaussianFocalLoss', reduction='mean'),
+                 aux_2d_loss_bbox=dict(
+                     type='L1Loss', reduction='mean', loss_weight=0.25),
+                 aux_2d_loss_weight=1.0,
+                 **kwargs):
+        super(BEVDetAux, self).__init__(**kwargs)
+        self.aux_2d_head = builder.build_head(aux_2d_head)
+        self.aux_2d_num_classes = aux_2d_head['heads']['heatmap'][0]
+        self.aux_2d_train_cfg = aux_2d_train_cfg or dict(
+            max_objs=150,
+            min_radius=2,
+            min_center_depth=0.5,
+            max_center_depth=80.0,
+            edge_margin=2.0)
+        self.aux_2d_loss_cls = builder.build_loss(aux_2d_loss_cls)
+        self.aux_2d_loss_bbox = builder.build_loss(aux_2d_loss_bbox)
+        self.aux_2d_loss_weight = aux_2d_loss_weight
+
+    def _extract_feat_with_aux(self, img_inputs):
+        """Extract BEV feature and keep 2D encoder features for aux branch."""
+        img_inputs = self.prepare_inputs(img_inputs)
+        img_feat_2d, _ = self.image_encoder(img_inputs[0])
+        x, depth = self.img_view_transformer([img_feat_2d] + img_inputs[1:7])
+        x = self.bev_encoder(x)
+        return [x], depth, img_feat_2d, img_inputs
+
+    def _gather_feat(self, feat, ind):
+        dim = feat.size(2)
+        ind = ind.unsqueeze(2).expand(ind.size(0), ind.size(1), dim)
+        return feat.gather(1, ind)
+
+    def _project_gt_centers_to_multiview(self, gt_bboxes_3d, gt_labels_3d,
+                                         img_inputs):
+        """Project 3D GT centers to each view and keep valid center targets."""
+        imgs, sensor2keyegos, _, intrins, post_rots, post_trans, bda = \
+            img_inputs
+        bsz, num_cams, _, img_h, img_w = imgs.shape
+        min_center_depth = self.aux_2d_train_cfg.get('min_center_depth', 0.5)
+        max_center_depth = self.aux_2d_train_cfg.get('max_center_depth', 80.0)
+        edge_margin = self.aux_2d_train_cfg.get('edge_margin', 2.0)
+        min_box_size = self.aux_2d_train_cfg.get('min_box_size', 2.0)
+        device = imgs.device
+        centers_2d_list = [[] for _ in range(bsz * num_cams)]
+        sizes_2d_list = [[] for _ in range(bsz * num_cams)]
+        labels_2d_list = [[] for _ in range(bsz * num_cams)]
+
+        with torch.no_grad():
+            for bid in range(bsz):
+                labels = gt_labels_3d[bid].to(device).long()
+                if labels.numel() == 0:
+                    continue
+
+                centers = gt_bboxes_3d[bid].gravity_center.to(
+                    device=device, dtype=torch.float32)
+                dims = gt_bboxes_3d[bid].dims.to(
+                    device=device, dtype=torch.float32)
+                yaws = gt_bboxes_3d[bid].yaw.to(
+                    device=device, dtype=torch.float32)
+                num_obj = centers.shape[0]
+                if num_obj == 0:
+                    continue
+
+                ones = torch.ones((num_obj, 1), device=device)
+                centers_h = torch.cat([centers, ones], dim=-1)
+                inv_bda = torch.inverse(bda[bid].to(torch.float32))
+                inv_bda_rot = inv_bda[:3, :3]
+                # Recover pre-BDA yaw by transforming heading vectors.
+                heading_aug = torch.stack(
+                    [torch.cos(yaws), torch.sin(yaws), torch.zeros_like(yaws)],
+                    dim=1)
+                heading_keyego = torch.matmul(heading_aug, inv_bda_rot.t())
+                yaw_keyego = torch.atan2(heading_keyego[:, 1],
+                                         heading_keyego[:, 0])
+                # BEVAug uses isotropic scale. Undo it for image-space size
+                # estimation so radius follows physical object size.
+                bda_rot = bda[bid, :3, :3].to(torch.float32)
+                bda_scale = torch.abs(torch.det(bda_rot)).clamp(
+                    min=1e-6).pow(1.0 / 3.0)
+                dims_keyego = dims / bda_scale
+                centers_keyego = torch.matmul(centers_h, inv_bda.t())[..., :3]
+                centers_keyego_h = torch.cat([centers_keyego, ones], dim=-1)
+
+                for cam_id in range(num_cams):
+                    keyego2cam = torch.inverse(
+                        sensor2keyegos[bid, cam_id].to(torch.float32))
+                    centers_cam = torch.matmul(centers_keyego_h,
+                                               keyego2cam.t())[..., :3]
+
+                    depths = centers_cam[..., 2]
+                    valid = (depths > min_center_depth) & \
+                        (depths < max_center_depth)
+                    if not valid.any():
+                        continue
+
+                    points_img = centers_cam / depths.clamp(
+                        min=1e-4).unsqueeze(-1)
+                    points_img = torch.matmul(
+                        points_img, intrins[bid, cam_id].to(torch.float32).t())
+                    points_img = torch.matmul(
+                        points_img,
+                        post_rots[bid, cam_id].to(torch.float32).t())
+                    points_img += post_trans[bid, cam_id].to(
+                        torch.float32).view(1, 1, 3)
+                    points_img = points_img[..., :2]
+
+                    intrin = intrins[bid, cam_id].to(torch.float32)
+                    post_rot = post_rots[bid, cam_id].to(torch.float32)
+                    fx = intrin[0, 0]
+                    fy = intrin[1, 1]
+                    aug_scale_x = torch.norm(post_rot[0, :2], p=2)
+                    aug_scale_y = torch.norm(post_rot[1, :2], p=2)
+                    cam_rot = keyego2cam[:3, :3]
+                    cos_yaw = torch.cos(yaw_keyego)
+                    sin_yaw = torch.sin(yaw_keyego)
+                    rot_kobj = torch.zeros((num_obj, 3, 3),
+                                           dtype=torch.float32,
+                                           device=device)
+                    rot_kobj[:, 0, 0] = cos_yaw
+                    rot_kobj[:, 0, 1] = -sin_yaw
+                    rot_kobj[:, 1, 0] = sin_yaw
+                    rot_kobj[:, 1, 1] = cos_yaw
+                    rot_kobj[:, 2, 2] = 1.0
+                    rot_cobj = torch.einsum('ij,njk->nik', cam_rot, rot_kobj)
+                    half_dims = 0.5 * dims_keyego
+                    # Oriented box half-extent projected to camera axes.
+                    ext_cam = torch.matmul(
+                        torch.abs(rot_cobj), half_dims.unsqueeze(-1)).squeeze(-1)
+                    proj_w = 2.0 * fx * ext_cam[:, 0] / depths.clamp(min=1e-4)
+                    proj_h = 2.0 * fy * ext_cam[:, 1] / depths.clamp(min=1e-4)
+                    proj_w = proj_w * aug_scale_x
+                    proj_h = proj_h * aug_scale_y
+                    valid = valid & \
+                        (points_img[..., 0] >= edge_margin) & \
+                        (points_img[..., 0] <= (img_w - 1 - edge_margin)) & \
+                        (points_img[..., 1] >= edge_margin) & \
+                        (points_img[..., 1] <= (img_h - 1 - edge_margin)) & \
+                        (proj_w >= min_box_size) & \
+                        (proj_h >= min_box_size)
+                    if not valid.any():
+                        continue
+
+                    list_id = bid * num_cams + cam_id
+                    valid_ids = valid.nonzero(as_tuple=False).squeeze(1)
+                    for obj_id in valid_ids:
+                        centers_2d_list[list_id].append(points_img[obj_id])
+                        sizes_2d_list[list_id].append(
+                            torch.stack([proj_w[obj_id], proj_h[obj_id]]))
+                        labels_2d_list[list_id].append(labels[obj_id])
+
+        for idx in range(bsz * num_cams):
+            if centers_2d_list[idx]:
+                centers_2d_list[idx] = torch.stack(centers_2d_list[idx], dim=0)
+                sizes_2d_list[idx] = torch.stack(sizes_2d_list[idx], dim=0)
+                labels_2d_list[idx] = torch.stack(labels_2d_list[idx], dim=0)
+            else:
+                centers_2d_list[idx] = torch.zeros((0, 2), device=device)
+                sizes_2d_list[idx] = torch.zeros((0, 2), device=device)
+                labels_2d_list[idx] = torch.zeros(
+                    (0, ), dtype=torch.long, device=device)
+        return centers_2d_list, sizes_2d_list, labels_2d_list
+
+    def _build_aux_2d_targets(self, centers_2d_list, sizes_2d_list,
+                              labels_2d_list, feat_h, feat_w, img_h, img_w,
+                              device):
+        max_objs = self.aux_2d_train_cfg.get('max_objs', 150)
+        min_radius = max(int(self.aux_2d_train_cfg.get('min_radius', 2)), 1)
+        min_overlap = self.aux_2d_train_cfg.get('min_overlap', 0.3)
+        num_imgs = len(centers_2d_list)
+
+        heatmaps = torch.zeros((num_imgs, self.aux_2d_num_classes, feat_h,
+                                feat_w),
+                               dtype=torch.float32,
+                               device=device)
+        reg_targets = torch.zeros((num_imgs, max_objs, 2),
+                                  dtype=torch.float32,
+                                  device=device)
+        inds = torch.zeros((num_imgs, max_objs), dtype=torch.long, device=device)
+        masks = torch.zeros((num_imgs, max_objs),
+                            dtype=torch.bool,
+                            device=device)
+
+        scale_x = float(feat_w) / float(img_w)
+        scale_y = float(feat_h) / float(img_h)
+
+        for img_id, (centers, sizes, labels) in enumerate(
+                zip(centers_2d_list, sizes_2d_list, labels_2d_list)):
+            if centers.numel() == 0:
+                continue
+            scale = centers.new_tensor([scale_x, scale_y])
+            valid_obj = 0
+            num_objs = min(centers.shape[0], max_objs)
+            for obj_id in range(num_objs):
+                cls_id = int(labels[obj_id].item())
+                if cls_id < 0 or cls_id >= self.aux_2d_num_classes:
+                    continue
+
+                center = centers[obj_id] * scale
+                center_int = center.to(torch.int32)
+                if not (0 <= center_int[0] < feat_w and
+                        0 <= center_int[1] < feat_h):
+                    continue
+
+                width = sizes[obj_id, 0] * scale_x
+                height = sizes[obj_id, 1] * scale_y
+                radius = gaussian_radius((height, width), min_overlap)
+                radius = max(min_radius, int(radius))
+                draw_heatmap_gaussian(heatmaps[img_id, cls_id], center_int,
+                                      radius)
+                x_int, y_int = center_int[0], center_int[1]
+                inds[img_id, valid_obj] = y_int * feat_w + x_int
+                masks[img_id, valid_obj] = 1
+                reg_targets[img_id, valid_obj, 0] = \
+                    center[0] - x_int.to(torch.float32)
+                reg_targets[img_id, valid_obj, 1] = \
+                    center[1] - y_int.to(torch.float32)
+                valid_obj += 1
+                if valid_obj >= max_objs:
+                    break
+        return heatmaps, reg_targets, inds, masks
+
+    def forward_img_auxiliary_train(self, img_feat_2d, gt_bboxes_3d,
+                                    gt_labels_3d, img_inputs):
+        bsz, num_cams, channels, feat_h, feat_w = img_feat_2d.shape
+        img_h, img_w = img_inputs[0].shape[-2:]
+        feats = img_feat_2d.reshape(bsz * num_cams, channels, feat_h, feat_w)
+        preds = self.aux_2d_head(feats)
+
+        centers_2d_list, sizes_2d_list, labels_2d_list = \
+            self._project_gt_centers_to_multiview(
+            gt_bboxes_3d, gt_labels_3d, img_inputs)
+        heatmaps, reg_targets, inds, masks = self._build_aux_2d_targets(
+            centers_2d_list, sizes_2d_list, labels_2d_list, feat_h, feat_w,
+            img_h, img_w, feats.device)
+
+        heatmap_pred = clip_sigmoid(preds['heatmap'])
+        num_pos = heatmaps.eq(1).float().sum().item()
+        cls_avg_factor = max(num_pos, 1.0)
+        loss_heatmap = self.aux_2d_loss_cls(
+            heatmap_pred, heatmaps, avg_factor=cls_avg_factor)
+
+        offset_pred = preds['offset'].permute(0, 2, 3, 1).contiguous()
+        offset_pred = offset_pred.reshape(
+            offset_pred.size(0), -1, offset_pred.size(3))
+        offset_pred = self._gather_feat(offset_pred, inds)
+        offset_targets = reg_targets
+        reg_mask = masks.unsqueeze(2).float()
+        num_reg = max(reg_mask.sum().item(), 1.0)
+        loss_offset = self.aux_2d_loss_bbox(
+            offset_pred,
+            offset_targets,
+            reg_mask.expand_as(offset_targets),
+            avg_factor=num_reg)
+
+        loss_weight = self.aux_2d_loss_weight
+        return dict(
+            loss_aux2d_heatmap=loss_heatmap * loss_weight,
+            loss_aux2d_offset=loss_offset * loss_weight)
+
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_labels=None,
+                      gt_bboxes=None,
+                      img_inputs=None,
+                      proposals=None,
+                      gt_bboxes_ignore=None,
+                      **kwargs):
+        img_feats, _, img_feat_2d, prepared_inputs = \
+            self._extract_feat_with_aux(img_inputs)
+
+        losses = dict()
+        losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
+                                            gt_labels_3d, img_metas,
+                                            gt_bboxes_ignore)
+        losses.update(losses_pts)
+        losses_aux2d = self.forward_img_auxiliary_train(
+            img_feat_2d, gt_bboxes_3d, gt_labels_3d, prepared_inputs)
+        losses.update(losses_aux2d)
+        return losses
 
 
 @DETECTORS.register_module()
@@ -380,7 +715,7 @@ class BEVDet4D(BEVDet):
 
     def prepare_bev_feat(self, img, rot, tran, intrin, post_rot, post_tran,
                          bda, mlp_input):
-        x, _ = self.image_encoder(img)
+        x, _ = self.image_encoder(img) # torch.Size([8, 6, 512, 16, 44])
         bev_feat, depth = self.img_view_transformer(
             [x, rot, tran, intrin, post_rot, post_tran, bda, mlp_input])
         if self.pre_process:
@@ -577,6 +912,633 @@ class BEVDepth4D(BEVDet4D):
                                             gt_bboxes_ignore)
         losses.update(losses_pts)
         return losses
+
+
+@DETECTORS.register_module()
+class BEVDepth4DDepthKD(BEVDepth4D):
+    """BEVDepth4D with additional depth distillation loss."""
+
+    def __init__(self, depth_kd_cfg=None, **kwargs):
+        super(BEVDepth4DDepthKD, self).__init__(**kwargs)
+        depth_kd_cfg = depth_kd_cfg or dict()
+        self.depth_kd_enabled = depth_kd_cfg.get('enabled', True)
+        self.depth_kd_loss_weight = float(depth_kd_cfg.get('loss_weight', 1.0))
+        self.depth_kd_loss_type = depth_kd_cfg.get('loss_type', 'kl')
+        self.depth_kd_temperature = float(depth_kd_cfg.get('temperature', 1.0))
+        self.depth_kd_teacher_source = depth_kd_cfg.get('teacher_source',
+                                                        'tensor')
+        self.depth_kd_teacher_key = depth_kd_cfg.get('teacher_key', 'gt_depth')
+        self.depth_kd_teacher_is_logits = bool(
+            depth_kd_cfg.get('teacher_is_logits', False))
+        self.depth_kd_teacher_depth_mode = depth_kd_cfg.get(
+            'teacher_depth_mode', 'metric')
+        self.depth_kd_ignore_if_missing = bool(
+            depth_kd_cfg.get('ignore_if_missing', True))
+        self.depth_kd_use_fg_mask = bool(
+            depth_kd_cfg.get('use_fg_mask', True))
+        self.depth_kd_grad_loss_weight = float(
+            depth_kd_cfg.get('grad_loss_weight', 0.0))
+        self.depth_kd_relative_loss_weight = float(
+            depth_kd_cfg.get('relative_loss_weight', 0.0))
+        self.depth_kd_relative_temperature = float(
+            depth_kd_cfg.get('relative_temperature', 1.0))
+        self.depth_kd_relative_min_diff = float(
+            depth_kd_cfg.get('relative_min_diff', 0.0))
+        self.depth_kd_relative_use_log_depth = bool(
+            depth_kd_cfg.get('relative_use_log_depth', False))
+        self.depth_kd_ray_loss_weight = float(
+            depth_kd_cfg.get('ray_loss_weight', 0.0))
+        self.depth_kd_ray_loss_type = depth_kd_cfg.get('ray_loss_type', 'l1')
+        # Dense spatial KD: keep original LiDAR depth loss path untouched,
+        # but compute KD map losses on high-resolution teacher maps.
+        self.depth_kd_dense_spatial = bool(
+            depth_kd_cfg.get('dense_spatial', False))
+        self.depth_kd_dense_base_loss = bool(
+            depth_kd_cfg.get('dense_base_loss', False))
+        self.depth_kd_dense_interp = depth_kd_cfg.get('dense_interp',
+                                                      'bilinear')
+        if self.depth_kd_loss_type not in ['kl', 'l1']:
+            raise ValueError('depth_kd_cfg.loss_type must be "kl" or "l1"')
+        if self.depth_kd_teacher_depth_mode not in ['metric', 'relative']:
+            raise ValueError(
+                'depth_kd_cfg.teacher_depth_mode must be "metric" '
+                'or "relative"')
+        if self.depth_kd_ray_loss_type not in ['l1', 'smooth_l1']:
+            raise ValueError(
+                'depth_kd_cfg.ray_loss_type must be "l1" or "smooth_l1"')
+        if self.depth_kd_dense_interp not in ['bilinear', 'nearest']:
+            raise ValueError(
+                'depth_kd_cfg.dense_interp must be "bilinear" or "nearest"')
+        if self.depth_kd_teacher_source not in ['tensor',
+                                                'depth_anything_v3']:
+            raise ValueError(
+                'depth_kd_cfg.teacher_source must be "tensor" or '
+                '"depth_anything_v3"')
+
+        da3_cfg = depth_kd_cfg.get('depth_anything_v3', dict())
+        self.da3_repo_path = da3_cfg.get('repo_path', 'Depth-Anything-3/src')
+        self.da3_model_name = da3_cfg.get('model_name', 'da3mono-large')
+        self.da3_pretrained = da3_cfg.get('pretrained', None)
+        self.da3_allow_random_init = bool(
+            da3_cfg.get('allow_random_init', False))
+        self.da3_device = da3_cfg.get('device', 'same')
+        self.da3_patch_size = int(da3_cfg.get('patch_size', 14))
+        self.da3_color_order = da3_cfg.get('color_order', 'rgb')
+        self.da3_input_size = da3_cfg.get('input_size', None)
+        self.da3_align_to_gt = bool(da3_cfg.get('align_to_gt', True))
+        self.da3_min_align_pixels = int(da3_cfg.get('min_align_pixels', 32))
+        self.da3_ref_view_strategy = da3_cfg.get('ref_view_strategy',
+                                                 'saddle_balanced')
+        if self.da3_color_order not in ['rgb', 'bgr']:
+            raise ValueError(
+                'depth_kd_cfg.depth_anything_v3.color_order must be "rgb" '
+                'or "bgr"')
+        if self.da3_input_size is not None:
+            if (not isinstance(self.da3_input_size, (list, tuple)) or
+                    len(self.da3_input_size) != 2):
+                raise ValueError(
+                    'depth_kd_cfg.depth_anything_v3.input_size must be '
+                    'None or [H, W]')
+            self.da3_input_size = (
+                int(self.da3_input_size[0]), int(self.da3_input_size[1]))
+
+        self._da3_teacher = None
+        self._da3_teacher_device = None
+
+    def _project_root(self):
+        return os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+
+    def _resolve_da3_repo_path(self):
+        repo_path = self.da3_repo_path
+        if repo_path is None:
+            return None
+        if not os.path.isabs(repo_path):
+            repo_path = os.path.join(self._project_root(), repo_path)
+        return os.path.abspath(repo_path)
+
+    def _resolve_da3_device(self, student_device):
+        if self.da3_device == 'same':
+            return student_device
+        device = torch.device(self.da3_device)
+        if device.type == 'cuda' and not torch.cuda.is_available():
+            return student_device
+        return device
+
+    def _load_depth_anything_teacher(self, device):
+        repo_path = self._resolve_da3_repo_path()
+        if repo_path and repo_path not in sys.path:
+            sys.path.insert(0, repo_path)
+        try:
+            from depth_anything_3.api import DepthAnything3
+        except ImportError as exc:
+            raise ImportError(
+                'Failed to import Depth-Anything-3. Set '
+                'depth_kd_cfg.depth_anything_v3.repo_path correctly and '
+                'install dependencies (e.g. `pip install -r '
+                'Depth-Anything-3/requirements.txt`).'
+            ) from exc
+
+        if self.da3_pretrained:
+            teacher = DepthAnything3.from_pretrained(self.da3_pretrained)
+        else:
+            if not self.da3_allow_random_init:
+                raise ValueError(
+                    'Depth-Anything-3 pretrained checkpoint is required. '
+                    'Set depth_kd_cfg.depth_anything_v3.pretrained or '
+                    'set allow_random_init=True.')
+            teacher = DepthAnything3(model_name=self.da3_model_name)
+
+        teacher = teacher.to(device)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        return teacher
+
+    def _get_depth_anything_teacher(self, student_device):
+        teacher_device = self._resolve_da3_device(student_device)
+        if self._da3_teacher is None:
+            self._da3_teacher = self._load_depth_anything_teacher(
+                teacher_device)
+            self._da3_teacher_device = teacher_device
+            return self._da3_teacher, teacher_device
+        if self._da3_teacher_device != teacher_device:
+            self._da3_teacher = self._da3_teacher.to(teacher_device)
+            self._da3_teacher_device = teacher_device
+        return self._da3_teacher, teacher_device
+
+    def _get_keyframe_images(self, img_inputs):
+        imgs = img_inputs[0]
+        B, N_all, C, H, W = imgs.shape
+        if N_all % self.num_frame != 0:
+            raise ValueError(
+                f'Invalid image count {N_all} for num_frame={self.num_frame}')
+        num_cams = N_all // self.num_frame
+        return imgs[:, :num_cams], (H, W)
+
+    def _prepare_da3_images(self, key_imgs):
+        da3_imgs = key_imgs
+        if self.da3_color_order == 'bgr':
+            da3_imgs = da3_imgs[:, :, [2, 1, 0], :, :]
+
+        B, N, C, H, W = da3_imgs.shape
+        da3_imgs = da3_imgs.view(B * N, C, H, W)
+        if self.da3_input_size is not None:
+            da3_imgs = F.interpolate(
+                da3_imgs,
+                size=self.da3_input_size,
+                mode='bilinear',
+                align_corners=False)
+        H, W = da3_imgs.shape[-2:]
+        if self.da3_patch_size > 1:
+            crop_h = (H // self.da3_patch_size) * self.da3_patch_size
+            crop_w = (W // self.da3_patch_size) * self.da3_patch_size
+            if crop_h <= 0 or crop_w <= 0:
+                raise ValueError(
+                    f'Invalid DA3 crop size ({crop_h}, {crop_w}) from '
+                    f'input ({H}, {W}) and patch_size={self.da3_patch_size}')
+            top = (H - crop_h) // 2
+            left = (W - crop_w) // 2
+            da3_imgs = da3_imgs[:, :, top:top + crop_h, left:left + crop_w]
+        H, W = da3_imgs.shape[-2:]
+        return da3_imgs.view(B, N, C, H, W)
+
+    def _align_teacher_depth_to_gt(self, teacher_depth, gt_depth):
+        if gt_depth is None:
+            return teacher_depth
+        aligned_depth = teacher_depth.clone()
+        B, N = teacher_depth.shape[:2]
+        eps = 1e-6
+        for b in range(B):
+            for n in range(N):
+                t = teacher_depth[b, n]
+                g = gt_depth[b, n].to(t.device)
+                valid = (t > 0.0) & (g > 0.0) & torch.isfinite(t) & \
+                    torch.isfinite(g)
+                if valid.sum() < self.da3_min_align_pixels:
+                    continue
+                t_med = torch.median(t[valid])
+                g_med = torch.median(g[valid])
+                if t_med > eps and torch.isfinite(g_med):
+                    aligned_depth[b, n] = t * (g_med / t_med)
+        return aligned_depth
+
+    @torch.no_grad()
+    def _infer_teacher_depth_from_da3(self, img_inputs, gt_depth=None):
+        key_imgs, (H, W) = self._get_keyframe_images(img_inputs)
+        teacher, teacher_device = self._get_depth_anything_teacher(
+            key_imgs.device)
+        da3_imgs = self._prepare_da3_images(key_imgs).to(
+            teacher_device, non_blocking=True).float()
+        raw_output = teacher(
+            da3_imgs,
+            ref_view_strategy=self.da3_ref_view_strategy,
+        )
+        teacher_depth = raw_output.get('depth', None)
+        if teacher_depth is None:
+            raise RuntimeError('Depth-Anything-3 output missing "depth".')
+        if teacher_depth.dim() == 5 and teacher_depth.shape[2] == 1:
+            teacher_depth = teacher_depth.squeeze(2)
+        if teacher_depth.dim() != 4:
+            raise RuntimeError(
+                f'Unexpected DA3 depth shape: {tuple(teacher_depth.shape)}')
+        teacher_depth = teacher_depth.to(key_imgs.device).float()
+        dH, dW = teacher_depth.shape[-2:]
+        if (dH, dW) != (H, W):
+            B, N = teacher_depth.shape[:2]
+            teacher_depth = F.interpolate(
+                teacher_depth.view(B * N, 1, dH, dW),
+                size=(H, W),
+                mode='bilinear',
+                align_corners=False).view(B, N, H, W)
+        teacher_depth = torch.where(
+            torch.isfinite(teacher_depth), teacher_depth,
+            torch.zeros_like(teacher_depth))
+        teacher_depth = teacher_depth.clamp(min=0.0)
+        if self.da3_align_to_gt:
+            teacher_depth = self._align_teacher_depth_to_gt(
+                teacher_depth, gt_depth)
+        return teacher_depth
+
+    def _metric_depth_to_prob(self, depth_map, target_img_hw=None):
+        """Convert metric depth map [B, N, H, W] to prob volume [BN, D, h, w]."""
+        B, N, H, W = depth_map.shape
+        if target_img_hw is not None and (H, W) != tuple(target_img_hw):
+            tgt_h, tgt_w = int(target_img_hw[0]), int(target_img_hw[1])
+            depth_map = F.interpolate(
+                depth_map.view(B * N, 1, H, W),
+                size=(tgt_h, tgt_w),
+                mode='nearest').view(B, N, tgt_h, tgt_w)
+            H, W = tgt_h, tgt_w
+        h = H // self.img_view_transformer.downsample
+        w = W // self.img_view_transformer.downsample
+        depth_prob = self.img_view_transformer.get_downsampled_gt_depth(
+            depth_map)
+        depth_prob = depth_prob.view(B * N, h, w, self.img_view_transformer.D)
+        return depth_prob.permute(0, 3, 1, 2).contiguous()
+
+    def _prepare_teacher_depth(self, teacher_depth, depth_preds):
+        """Prepare teacher depth as [BN, D, h, w] probabilities."""
+        if isinstance(teacher_depth, (list, tuple)):
+            if len(teacher_depth) == 1:
+                teacher_depth = teacher_depth[0]
+            else:
+                raise ValueError('teacher depth list/tuple must have length 1')
+
+        if not torch.is_tensor(teacher_depth):
+            teacher_depth = torch.as_tensor(teacher_depth)
+        teacher_depth = teacher_depth.to(depth_preds.device)
+        target_img_hw = (
+            depth_preds.shape[2] * self.img_view_transformer.downsample,
+            depth_preds.shape[3] * self.img_view_transformer.downsample)
+
+        if teacher_depth.dim() == 4:
+            if teacher_depth.shape[1] == self.img_view_transformer.D and \
+                    teacher_depth.shape[2:] == depth_preds.shape[2:]:
+                teacher_prob = teacher_depth
+            else:
+                teacher_prob = self._metric_depth_to_prob(
+                    teacher_depth, target_img_hw=target_img_hw)
+        elif teacher_depth.dim() == 5 and \
+                teacher_depth.shape[2] == self.img_view_transformer.D and \
+                teacher_depth.shape[3:] == depth_preds.shape[2:]:
+            teacher_prob = teacher_depth.flatten(0, 1)
+        else:
+            raise ValueError(
+                'Unsupported teacher depth shape. Expected [B,N,H,W], '
+                '[BN,D,h,w], or [B,N,D,h,w].')
+        if teacher_prob.shape[2:] != depth_preds.shape[2:]:
+            teacher_prob = F.interpolate(
+                teacher_prob,
+                size=depth_preds.shape[2:],
+                mode='bilinear',
+                align_corners=False)
+
+        eps = 1e-6
+        if self.depth_kd_teacher_is_logits:
+            teacher_prob = F.softmax(
+                teacher_prob / max(self.depth_kd_temperature, eps), dim=1)
+        else:
+            teacher_prob = teacher_prob.clamp(min=0.0)
+            teacher_prob = teacher_prob / teacher_prob.sum(
+                dim=1, keepdim=True).clamp(min=eps)
+        return teacher_prob
+
+    def _prepare_teacher_depth_map(self,
+                                   teacher_depth,
+                                   depth_preds,
+                                   target_hw=None):
+        """Prepare teacher depth map as [BN, h, w] (no depth-bin conversion)."""
+        if isinstance(teacher_depth, (list, tuple)):
+            if len(teacher_depth) == 1:
+                teacher_depth = teacher_depth[0]
+            else:
+                raise ValueError('teacher depth list/tuple must have length 1')
+
+        if not torch.is_tensor(teacher_depth):
+            teacher_depth = torch.as_tensor(teacher_depth)
+        teacher_depth = teacher_depth.to(depth_preds.device).float()
+
+        if teacher_depth.dim() == 4 and \
+                teacher_depth.shape[1] == self.img_view_transformer.D and \
+                teacher_depth.shape[2:] == depth_preds.shape[2:]:
+            # [BN, D, h, w] depth probability/logit volume.
+            teacher_map = self._prob_to_expected_depth(teacher_depth)
+        elif teacher_depth.dim() == 5 and \
+                teacher_depth.shape[2] == self.img_view_transformer.D and \
+                teacher_depth.shape[3:] == depth_preds.shape[2:]:
+            # [B, N, D, h, w] depth probability/logit volume.
+            teacher_map = self._prob_to_expected_depth(
+                teacher_depth.flatten(0, 1))
+        elif teacher_depth.dim() == 4:
+            B, N = teacher_depth.shape[:2]
+            teacher_map = teacher_depth.view(B * N, teacher_depth.shape[2],
+                                             teacher_depth.shape[3])
+        elif teacher_depth.dim() == 3:
+            teacher_map = teacher_depth
+        else:
+            raise ValueError(
+                'Unsupported teacher depth shape for map mode. '
+                'Expected [B,N,H,W] or [BN,H,W].')
+
+        if target_hw is None:
+            target_hw = teacher_map.shape[1:]
+        if teacher_map.shape[1:] != tuple(target_hw):
+            teacher_map = F.interpolate(
+                teacher_map.unsqueeze(1),
+                size=tuple(target_hw),
+                mode='bilinear',
+                align_corners=False).squeeze(1)
+        teacher_map = torch.where(
+            torch.isfinite(teacher_map), teacher_map,
+            torch.zeros_like(teacher_map))
+        return teacher_map.clamp(min=0.0)
+
+    def _get_depth_bin_values(self, device, dtype):
+        depth_cfg = self.img_view_transformer.grid_config['depth']
+        d_min, d_max, d_step = float(depth_cfg[0]), float(depth_cfg[1]), \
+            float(depth_cfg[2])
+        D = int(self.img_view_transformer.D)
+        if self.img_view_transformer.sid:
+            if D <= 1:
+                vals = torch.tensor([d_min], device=device, dtype=dtype)
+            else:
+                idx = torch.arange(D, device=device, dtype=dtype)
+                vals = torch.exp(
+                    torch.log(torch.tensor(d_min, device=device, dtype=dtype))
+                    + idx / (D - 1) * torch.log(
+                        torch.tensor((d_max - 1.0) / d_min,
+                                     device=device,
+                                     dtype=dtype)))
+        else:
+            vals = d_min + torch.arange(
+                D, device=device, dtype=dtype) * d_step
+        return vals
+
+    def _prob_to_expected_depth(self, prob):
+        # prob: [BN, D, h, w] -> expected depth: [BN, h, w]
+        bin_vals = self._get_depth_bin_values(prob.device, prob.dtype)
+        return (prob * bin_vals.view(1, -1, 1, 1)).sum(dim=1)
+
+    def _build_depth_fg_mask(self, teacher_prob, gt_depth=None):
+        if self.depth_kd_use_fg_mask and gt_depth is not None:
+            fg = self.img_view_transformer.get_downsampled_gt_depth(gt_depth)
+            fg = (fg.max(dim=1).values > 0.0).to(teacher_prob.dtype)
+            fg = fg.view(teacher_prob.shape[0], teacher_prob.shape[2],
+                         teacher_prob.shape[3])
+            return fg
+        return (teacher_prob.sum(dim=1) > 0.0).to(teacher_prob.dtype)
+
+    def _build_depth_fg_mask_from_map(self, teacher_map, gt_depth=None):
+        if self.depth_kd_use_fg_mask and gt_depth is not None:
+            fg = self.img_view_transformer.get_downsampled_gt_depth(gt_depth)
+            fg = (fg.max(dim=1).values > 0.0).to(teacher_map.dtype)
+            fg = fg.view(teacher_map.shape[0], teacher_map.shape[1],
+                         teacher_map.shape[2])
+            return fg
+        return (teacher_map > 0.0).to(teacher_map.dtype)
+
+    def _normalize_depth_map_by_fg_median(self, depth_map, fg_mask):
+        """Scale each map by its foreground median for relative-depth losses."""
+        out = depth_map.clone()
+        eps = 1e-6
+        for i in range(out.shape[0]):
+            d = out[i]
+            m = fg_mask[i] > 0.0
+            valid = m & torch.isfinite(d) & (d > 0.0)
+            if valid.sum() == 0:
+                continue
+            med = torch.median(d[valid])
+            if torch.isfinite(med) and med > eps:
+                out[i] = d / med
+        return out
+
+    def _distill_gradient_loss(self, student_depth, teacher_depth, fg_mask):
+        # depth: [BN, h, w], fg_mask: [BN, h, w]
+        eps = 1e-6
+        dx_s = student_depth[:, :, 1:] - student_depth[:, :, :-1]
+        dx_t = teacher_depth[:, :, 1:] - teacher_depth[:, :, :-1]
+        mx = fg_mask[:, :, 1:] * fg_mask[:, :, :-1]
+        dy_s = student_depth[:, 1:, :] - student_depth[:, :-1, :]
+        dy_t = teacher_depth[:, 1:, :] - teacher_depth[:, :-1, :]
+        my = fg_mask[:, 1:, :] * fg_mask[:, :-1, :]
+
+        loss_x = (dx_s - dx_t).abs() * mx
+        loss_y = (dy_s - dy_t).abs() * my
+        denom = (mx.sum() + my.sum()).clamp(min=eps)
+        return (loss_x.sum() + loss_y.sum()) / denom
+
+    def _distill_relative_loss(self, student_depth, teacher_depth, fg_mask):
+        # Local ordinal KD on 4-neighbor pairs (right/down).
+        eps = 1e-6
+        tau = max(self.depth_kd_relative_temperature, eps)
+        min_diff = self.depth_kd_relative_min_diff
+
+        if self.depth_kd_relative_use_log_depth:
+            student_depth = torch.log(student_depth.clamp(min=eps))
+            teacher_depth = torch.log(teacher_depth.clamp(min=eps))
+
+        def _dir_loss(sd, td, m):
+            valid = (m > 0.0) & torch.isfinite(sd) & torch.isfinite(td) & \
+                (td.abs() > min_diff)
+            if valid.sum() == 0:
+                return sd.new_tensor(0.0), sd.new_tensor(0.0)
+            sign_t = torch.sign(td[valid])
+            logits = sign_t * sd[valid] / tau
+            # logistic ranking loss
+            loss = F.softplus(-logits).sum()
+            denom = valid.sum().to(sd.dtype)
+            return loss, denom
+
+        dx_s = student_depth[:, :, 1:] - student_depth[:, :, :-1]
+        dx_t = teacher_depth[:, :, 1:] - teacher_depth[:, :, :-1]
+        mx = fg_mask[:, :, 1:] * fg_mask[:, :, :-1]
+        loss_x, den_x = _dir_loss(dx_s, dx_t, mx)
+
+        dy_s = student_depth[:, 1:, :] - student_depth[:, :-1, :]
+        dy_t = teacher_depth[:, 1:, :] - teacher_depth[:, :-1, :]
+        my = fg_mask[:, 1:, :] * fg_mask[:, :-1, :]
+        loss_y, den_y = _dir_loss(dy_s, dy_t, my)
+
+        denom = (den_x + den_y).clamp(min=eps)
+        return (loss_x + loss_y) / denom
+
+    def _distill_ray_loss(self, student_prob, teacher_prob, fg_mask):
+        # Distill cumulative transmittance along depth bins (camera-ray KD).
+        eps = 1e-6
+        s_trans = 1.0 - torch.cumsum(student_prob, dim=1)
+        t_trans = 1.0 - torch.cumsum(teacher_prob, dim=1)
+        mask = fg_mask.unsqueeze(1).expand_as(s_trans)
+        if self.depth_kd_ray_loss_type == 'smooth_l1':
+            loss = F.smooth_l1_loss(
+                s_trans, t_trans, reduction='none', beta=1.0)
+        else:
+            loss = (s_trans - t_trans).abs()
+        denom = mask.sum().clamp(min=eps)
+        return (loss * mask).sum() / denom
+
+    def _get_depth_kd_core(self, depth_preds, teacher_depth, gt_depth=None):
+        teacher_prob = self._prepare_teacher_depth(teacher_depth, depth_preds)
+        eps = 1e-6
+
+        student_prob = depth_preds.clamp(min=eps, max=1.0)
+        if self.depth_kd_temperature != 1.0:
+            inv_temp = 1.0 / max(self.depth_kd_temperature, eps)
+            student_prob = student_prob.pow(inv_temp)
+            student_prob = student_prob / student_prob.sum(
+                dim=1, keepdim=True).clamp(min=eps)
+
+        fg = self._build_depth_fg_mask(teacher_prob, gt_depth=gt_depth)
+        return student_prob, teacher_prob, fg
+
+    @force_fp32()
+    def get_depth_kd_loss(self, depth_preds, teacher_depth, gt_depth=None):
+        kd_losses = self.get_depth_kd_losses(
+            depth_preds=depth_preds,
+            teacher_depth=teacher_depth,
+            gt_depth=gt_depth)
+        return kd_losses['loss_depth_kd']
+
+    @force_fp32()
+    def get_depth_kd_losses(self, depth_preds, teacher_depth, gt_depth=None):
+        # 1) Top-level branch by teacher mode.
+        mode = self.depth_kd_teacher_depth_mode  # 'metric' or 'relative'
+
+        need_prob = self.depth_kd_ray_loss_weight > 0.0
+        need_map = (self.depth_kd_loss_weight > 0.0) or \
+            (self.depth_kd_grad_loss_weight > 0.0) or \
+            (self.depth_kd_relative_loss_weight > 0.0)
+
+        student_prob, teacher_prob, fg_prob = None, None, None
+        if need_prob:
+            student_prob, teacher_prob, fg_prob = self._get_depth_kd_core(
+                depth_preds=depth_preds,
+                teacher_depth=teacher_depth,
+                gt_depth=gt_depth)
+        else:
+            eps = 1e-6
+            student_prob = depth_preds.clamp(min=eps, max=1.0)
+            student_prob = student_prob / student_prob.sum(
+                dim=1, keepdim=True).clamp(min=eps)
+
+        student_depth_map, teacher_depth_map, fg_map = None, None, None
+        if need_map:
+            student_depth_map = self._prob_to_expected_depth(student_prob)
+            # Keep student map resolution and downsample teacher map to match.
+            teacher_depth_map = self._prepare_teacher_depth_map(
+                teacher_depth,
+                depth_preds,
+                target_hw=student_depth_map.shape[1:])
+            fg_map = self._build_depth_fg_mask_from_map(
+                teacher_depth_map, gt_depth=gt_depth)
+            if mode == 'relative':
+                # Relative teacher has arbitrary per-view scale.
+                student_depth_map = self._normalize_depth_map_by_fg_median(
+                    student_depth_map, fg_map)
+                teacher_depth_map = self._normalize_depth_map_by_fg_median(
+                    teacher_depth_map, fg_map)
+
+        losses = dict(loss_depth_kd=depth_preds.new_tensor(0.0))
+        if self.depth_kd_loss_weight > 0.0:
+            loss = (student_depth_map - teacher_depth_map).abs()
+            denom = fg_map.sum().clamp(min=1.0)
+            loss_base = (loss * fg_map).sum() / denom
+            losses['loss_depth_kd'] = loss_base * self.depth_kd_loss_weight
+
+        # Ray KD is independent from base representation branch.
+        if self.depth_kd_ray_loss_weight > 0.0:
+            loss_ray = self._distill_ray_loss(
+                student_prob, teacher_prob, fg_prob)
+            losses['loss_depth_kd_ray'] = \
+                loss_ray * self.depth_kd_ray_loss_weight
+
+        # Gradient / local-relative KD are independent optional heads.
+        if self.depth_kd_grad_loss_weight > 0.0:
+            loss_grad = self._distill_gradient_loss(
+                student_depth_map, teacher_depth_map, fg_map)
+            losses['loss_depth_kd_grad'] = \
+                loss_grad * self.depth_kd_grad_loss_weight
+
+        if self.depth_kd_relative_loss_weight > 0.0:
+            loss_relative = self._distill_relative_loss(
+                student_depth_map, teacher_depth_map, fg_map)
+            losses['loss_depth_kd_relative'] = \
+                loss_relative * self.depth_kd_relative_loss_weight
+        return losses
+
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_labels=None,
+                      gt_bboxes=None,
+                      img_inputs=None,
+                      proposals=None,
+                      gt_bboxes_ignore=None,
+                      **kwargs):
+        img_feats, pts_feats, depth = self.extract_feat(
+            points, img=img_inputs, img_metas=img_metas, **kwargs)
+        gt_depth = kwargs['gt_depth']
+        loss_depth = self.img_view_transformer.get_depth_loss(gt_depth, depth)
+        losses = dict(loss_depth=loss_depth)
+
+        if self.depth_kd_enabled:
+            if self.depth_kd_teacher_source == 'depth_anything_v3':
+                try:
+                    teacher_depth = self._infer_teacher_depth_from_da3(
+                        img_inputs, gt_depth=gt_depth)
+                except Exception:
+                    if self.depth_kd_ignore_if_missing:
+                        teacher_depth = None
+                    else:
+                        raise
+            else:
+                teacher_depth = kwargs.get(self.depth_kd_teacher_key, None)
+            if teacher_depth is not None:
+                losses_kd = self.get_depth_kd_losses(
+                    depth_preds=depth,
+                    teacher_depth=teacher_depth,
+                    gt_depth=gt_depth)
+                losses.update(losses_kd)
+            elif not self.depth_kd_ignore_if_missing:
+                raise KeyError(
+                    f'Missing depth KD teacher key: {self.depth_kd_teacher_key}')
+
+        losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
+                                            gt_labels_3d, img_metas,
+                                            gt_bboxes_ignore)
+        losses.update(losses_pts)
+        return losses
+
+
+@DETECTORS.register_module()
+class BEVDepthDepthKD(BEVDepth4DDepthKD):
+    """Single-frame BEVDepth with depth distillation."""
+
+    def __init__(self, num_adj=0, with_prev=False, **kwargs):
+        super(BEVDepthDepthKD, self).__init__(
+            num_adj=num_adj, with_prev=with_prev, **kwargs)
 
 
 @DETECTORS.register_module()

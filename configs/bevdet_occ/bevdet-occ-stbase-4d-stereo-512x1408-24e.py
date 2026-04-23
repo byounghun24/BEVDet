@@ -300,6 +300,7 @@ custom_hooks = [
         type='MEGVIIEMAHook',
         init_updates=10560,
         priority='NORMAL',
+        max_keep_ckpts=1,
     ),
     dict(
         type='SyncbnControlHook',

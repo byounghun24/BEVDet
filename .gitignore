@@ -117,6 +117,7 @@ data
 work_dirs/
 outputs/
 outputs_bh/
+outputs_bh
 wandb/
 *.wandb
 events.out.tfevents.*
@@ -124,6 +125,9 @@ events.out.tfevents.*
 *.onnx
 *.trt
 *.plan
+tensorrt/
+Depth-Anything-3/
+bevdet-tensorrt-cpp/
 exps/
 *~
 mmdet3d/.mim

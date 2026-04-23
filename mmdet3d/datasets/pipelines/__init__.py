@@ -3,6 +3,7 @@ from .compose import Compose
 from .dbsampler import DataBaseSampler
 from .formating import Collect3D, DefaultFormatBundle, DefaultFormatBundle3D
 from .loading import (LoadAnnotations3D, LoadAnnotations, BEVAug,
+                      LoadTeacherDepthFromNPZ,
                       LoadImageFromFileMono3D, LoadMultiViewImageFromFiles,
                       LoadPointsFromDict, LoadPointsFromFile,
                       LoadPointsFromFileTCAR,
@@ -37,4 +38,5 @@ __all__ = [
     'LoadPointsFromDict', 'MultiViewWrapper', 'RandomRotate',
     'RangeLimitedRandomCrop', 'PrepareImageInputs', 'PointToMultiViewDepth',
     'LoadOccGTFromFile', 'ToEgo', 'VelocityAug', 'LoadAnnotations', 'BEVAug',
+    'LoadTeacherDepthFromNPZ'
 ]

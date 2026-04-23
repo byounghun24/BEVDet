@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv.cnn import build_norm_layer
 
 from torch.utils.checkpoint import checkpoint
@@ -93,6 +94,9 @@ class FPN_LSS(nn.Module):
         if self.lateral:
             x2 = self.lateral_conv(x2)
         x1 = self.up(x1)
+        if x1.shape[-2:] != x2.shape[-2:]:
+            x1 = F.interpolate(
+                x1, size=x2.shape[-2:], mode='bilinear', align_corners=True)
         x = torch.cat([x2, x1], dim=1)
         if self.input_conv is not None:
             x = self.input_conv(x)

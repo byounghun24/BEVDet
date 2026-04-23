@@ -826,10 +826,10 @@ class LSSViewTransformerBEVDepth(LSSViewTransformer):
         B, N, C, H, W = x.shape
         x = x.view(B * N, C, H, W)
         x = self.depth_net(x, mlp_input, stereo_metas)
-        depth_digit = x[:, :self.D, ...]
-        tran_feat = x[:, self.D:self.D + self.out_channels, ...]
-        depth = depth_digit.softmax(dim=1)
-        bev_feat, depth = self.view_transform(input, depth, tran_feat)
+        depth_digit = x[:, :self.D, ...] # torch.Size([48, 118, 16, 44])
+        tran_feat = x[:, self.D:self.D + self.out_channels, ...] # torch.Size([48, 80, 16, 44])
+        depth = depth_digit.softmax(dim=1) # torch.Size([48, 118, 16, 44])
+        bev_feat, depth = self.view_transform(input, depth, tran_feat) # torch.Size([8, 80, 128, 128]), torch.Size([48, 118, 16, 44])
         return bev_feat, depth
 
 
